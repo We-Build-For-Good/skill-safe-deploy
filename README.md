@@ -1,4 +1,4 @@
-# Safe Deploy: The Calm Release Protocol
+# Safe Deploy: The Production Release Protocol
 
 > **An open-source AI engineering protocol from [We Build for Good](https://webuildforgood.com)**  
 > *Let AI do the preparation. Keep releases boring.*
@@ -23,7 +23,7 @@ Letting an autonomous coding agent touch a live production application is one of
 * Trust piped command outputs that mask failure exit codes.
 * Deploy unverified code without a restorable database backup.
 
-`safe-deploy` turns a stressful release into a calm, five-step verified sequence where nothing can go wrong that you cannot immediately undo.
+`safe-deploy` turns a stressful release into a predictable, five-step verified sequence where nothing can go wrong that you cannot immediately undo.
 
 ---
 

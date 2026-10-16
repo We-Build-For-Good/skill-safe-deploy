@@ -1,17 +1,17 @@
 ---
 name: safe-deploy
-description: Safely ship accumulated changes to a live product: the "Calm Release" procedure. Take a verified backup, block irreversible data loss, deploy in staged verified steps, trust system exit codes over agent assertions, and keep the human on the irreversible buttons. Use whenever deploying to production, running database migrations, releasing AI-built code, or when nervous about a live update.
+description: Safely ship accumulated changes to a live product: the Production Release Protocol. Take a verified backup, block irreversible data loss, deploy in staged verified steps, trust system exit codes over agent assertions, and keep the human on the irreversible buttons. Use whenever deploying to production, running database migrations, releasing AI-built code, or when nervous about a live update.
 license: MIT
 metadata:
   author: We Build for Good
   version: "1.0.0"
 ---
 
-# Safe Deploy: The Calm Release Protocol
+# Safe Deploy: The Production Release Protocol
 
 Shipping a large pile of changes to a live product is only scary when there is no system. 
 
-This is the system: five rules, in order, that make a major release calm because nothing can go wrong that you cannot undo. 
+This is the system: five rules, in order, that make a major release predictable because nothing can go wrong that you cannot undo. 
 
 It was extracted from a real production release where a live application sat frozen for a month with tens of thousands of lines of finished work and 11 database migrations stacked behind it. It was shipped in a single session with zero downtime, zero broken features, and a backup that was never needed.
 
