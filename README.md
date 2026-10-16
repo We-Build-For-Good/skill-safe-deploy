@@ -42,20 +42,20 @@ Letting an autonomous coding agent touch a live production application is one of
 ### For Claude Code
 Clone or copy this folder into your skills directory:
 ```bash
-git clone https://github.com/webuildforgood/skill-safe-deploy.git ~/.claude/skills/safe-deploy
+git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git ~/.claude/skills/safe-deploy
 ```
 
 ### For Cursor
 Add this skill to your workspace skills directory:
 ```bash
 mkdir -p .cursor/skills
-git clone https://github.com/webuildforgood/skill-safe-deploy.git .cursor/skills/safe-deploy
+git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git .cursor/skills/safe-deploy
 ```
 
 ### For Antigravity / Open Agent Skills
 ```bash
 mkdir -p .agents/skills
-git clone https://github.com/webuildforgood/skill-safe-deploy.git .agents/skills/safe-deploy
+git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git .agents/skills/safe-deploy
 ```
 
 ---
