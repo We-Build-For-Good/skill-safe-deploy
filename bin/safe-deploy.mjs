@@ -17,7 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -319,7 +319,20 @@ export function executeCli(args = process.argv.slice(2)) {
   return result.success ? 0 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const exitCode = executeCli();
-  process.exit(exitCode);
+// Direct invocation check (handles symlinks properly)
+if (process.argv[1]) {
+  try {
+    const isMain = import.meta.url === pathToFileURL(process.argv[1]).href ||
+      import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+    if (isMain) {
+      const exitCode = executeCli();
+      process.exit(exitCode);
+    }
+  } catch {
+    // If realpath fails, fallback to direct compare
+    if (import.meta.url === `file://${process.argv[1]}`) {
+      const exitCode = executeCli();
+      process.exit(exitCode);
+    }
+  }
 }
