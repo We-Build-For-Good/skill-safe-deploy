@@ -1,6 +1,6 @@
 {
   "name": "@webuildforgood/skill-safe-deploy",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Deterministic studio delivery pipeline chaining prior-art verification, invariant checks, visual sensory audits, and staged release packaging with human approval boundaries.",
   "main": "bin/safe-deploy.mjs",
   "bin": {

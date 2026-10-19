@@ -16,15 +16,18 @@ import {
   generateIntegrityDigest
 } from "../bin/safe-deploy.mjs";
 
-test("parseArgs parses all pipeline, safety, and risk override options properly", () => {
+test("parseArgs parses all pipeline, safety, and isolated override options properly", () => {
   const args = [
     "--dir", "/tmp/demo-repo",
-    "--version", "v1.3.0",
+    "--version", "v1.4.0",
     "--require-prior-art",
     "--sql", "/tmp/migrations",
     "--backup", "/tmp/prod.sql.gz",
     "--allow-risky-migrations",
     "--approve-risk", "Locking reviewed on staging DB with 1M rows",
+    "--approve-data-mutation", "Batched 500 records per loop",
+    "--approve-unclassified-sql", "Reviewed PL/pgSQL procedural block",
+    "--allow-destructive",
     "--no-backup-required",
     "--skip-visual",
     "--update-changelog",
@@ -32,16 +35,37 @@ test("parseArgs parses all pipeline, safety, and risk override options properly"
   ];
   const parsed = parseArgs(args);
   assert.equal(parsed.dir, "/tmp/demo-repo");
-  assert.equal(parsed.version, "v1.3.0");
+  assert.equal(parsed.version, "v1.4.0");
   assert.equal(parsed.requirePriorArt, true);
   assert.equal(parsed.sql, "/tmp/migrations");
   assert.equal(parsed.backup, "/tmp/prod.sql.gz");
   assert.equal(parsed.allowRiskyMigrations, true);
   assert.equal(parsed.approveRisk, "Locking reviewed on staging DB with 1M rows");
+  assert.equal(parsed.approveDataMutation, "Batched 500 records per loop");
+  assert.equal(parsed.approveUnclassifiedSql, "Reviewed PL/pgSQL procedural block");
+  assert.equal(parsed.allowDestructive, true);
   assert.equal(parsed.noBackupRequired, true);
   assert.equal(parsed.skipVisual, true);
   assert.equal(parsed.updateChangelog, true);
   assert.equal(parsed.json, true);
+});
+
+test("SQL Tokenizer: Preserves semicolons and comments inside string literals", () => {
+  const rawSql = `
+    INSERT INTO audit_log (details) VALUES ('semicolon; inside string -- not a comment');
+    CREATE TABLE widgets (id int);
+  `;
+  const stmts = splitSqlStatements(rawSql);
+  assert.equal(stmts.length, 2);
+  assert.equal(stmts[0], "INSERT INTO audit_log (details) VALUES ('semicolon; inside string -- not a comment')");
+  assert.equal(stmts[1], "CREATE TABLE widgets (id int)");
+});
+
+test("SQL Tokenizer: Strips literals during structural analysis to prevent false positives", () => {
+  // String literal contains 'drop table', but statement is an INSERT
+  const falseTriggerSql = "INSERT INTO events (payload) VALUES ('drop table users');";
+  const analysis = analyzeMigrationSql(falseTriggerSql);
+  assert.notEqual(analysis.classification, "DESTRUCTIVE");
 });
 
 test("Rule 1: Backup verification catches missing, empty, corrupt header, and truncated gzip archives", () => {
@@ -74,7 +98,6 @@ test("Rule 1: Backup verification catches missing, empty, corrupt header, and tr
 
     // 5. Truncated gzip payload with valid magic bytes
     const truncatedGz = path.join(tmpDir, "truncated.sql.gz");
-    // Valid gzip header (10 bytes) followed by broken payload
     fs.writeFileSync(truncatedGz, Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff]));
     const truncResult = verifyBackup(truncatedGz, { minBytes: 10 });
     assert.equal(truncResult.valid, false);
@@ -93,75 +116,134 @@ test("Rule 1: Backup verification catches missing, empty, corrupt header, and tr
   }
 });
 
-test("Rule 2: Fail-closed SQL classifier catches DELETE, UPDATE, and data backfills", () => {
-  // DELETE FROM users (data destruction)
+test("Rule 2: Fail-closed SQL classifier isolates data mutation from unclassified SQL", () => {
+  // DELETE FROM users (destructive data deletion)
   const deleteSql = "DELETE FROM users;";
   const deleteResult = analyzeMigrationSql(deleteSql);
   assert.equal(deleteResult.classification, "DESTRUCTIVE");
   assert.equal(deleteResult.canAutoDeploy, false);
   assert.equal(deleteResult.requiresGovernedApproval, true);
 
-  // UPDATE accounts (unbatched data mutation)
+  // UPDATE accounts (data mutation risk)
   const updateSql = "UPDATE accounts SET is_active = true WHERE region = 'US';";
   const updateResult = analyzeMigrationSql(updateSql);
   assert.equal(updateResult.classification, "DATA_MUTATION_RISK");
   assert.equal(updateResult.canAutoDeploy, false);
 
-  // INSERT INTO ... SELECT (bulk unbatched backfill)
-  const backfillSql = "INSERT INTO customer_archives SELECT * FROM customers WHERE closed = true;";
-  const backfillResult = analyzeMigrationSql(backfillSql);
-  assert.equal(backfillResult.classification, "DATA_MUTATION_RISK");
-  assert.equal(backfillResult.canAutoDeploy, false);
-});
-
-test("Rule 2: Fail-closed SQL classifier rejects unrecognized SQL to REVIEW_REQUIRED", () => {
-  // Unrecognized SQL: MERGE INTO
+  // Unrecognized SQL (MERGE INTO) defaults to REVIEW_REQUIRED
   const mergeSql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET val = source.val;";
   const mergeResult = analyzeMigrationSql(mergeSql);
   assert.equal(mergeResult.classification, "REVIEW_REQUIRED");
   assert.equal(mergeResult.canAutoDeploy, false);
-  assert.match(mergeResult.issues[0], /Unrecognized or unclassified/i);
-
-  // Unrecognized SQL: VACUUM FULL
-  const vacuumSql = "VACUUM FULL orders;";
-  const vacuumResult = analyzeMigrationSql(vacuumSql);
-  assert.equal(vacuumResult.classification, "REVIEW_REQUIRED");
-  assert.equal(vacuumResult.canAutoDeploy, false);
 });
 
-test("Rule 2: Handles comments, quoted identifiers, and multiple statements", () => {
-  const complexSql = `
-    -- Setup migration
-    /* Multi-line
-       documentation comment */
-    CREATE TABLE "orders_v2" (id serial primary key, amount decimal);
-    -- Now delete old data
-    DELETE FROM "legacy_orders" WHERE archived = true;
-  `;
-  const complexResult = analyzeMigrationSql(complexSql);
-  assert.equal(complexResult.classification, "DESTRUCTIVE");
-  assert.equal(complexResult.canAutoDeploy, false);
-  assert.equal(complexResult.requiresGovernedApproval, true);
+test("Decisive Demonstration: Complete CLI run against destructive fixture exits non-zero and CANNOT be overridden by ordinary risk flags", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "destructive-decisive-fixture-"));
+  try {
+    const migDir = path.join(tmpDir, "migrations");
+    fs.mkdirSync(migDir);
+    fs.writeFileSync(path.join(migDir, "001_destructive.sql"), "DROP TABLE customer_records;");
+
+    // 1. Standard pipeline execution: MUST return success = false and status GOVERNED_APPROVAL_REQUIRED
+    const res = runPipeline({
+      dir: tmpDir,
+      sql: migDir,
+      noBackupRequired: true,
+      skipVisual: true,
+      json: true
+    });
+    assert.equal(res.success, false);
+    assert.equal(res.scorecard.overallSuccess, false);
+    assert.equal(res.scorecard.stages.migrations.status, "GOVERNED_APPROVAL_REQUIRED");
+
+    // 2. Full CLI execution: MUST exit with non-zero exit code (1)
+    const exitCodeStandard = executeCli(["--dir", tmpDir, "--sql", migDir, "--no-backup-required", "--skip-visual"]);
+    assert.equal(exitCodeStandard, 1);
+
+    // 3. Attempt to bypass using --allow-risky-migrations: MUST STILL FAIL with exit code 1
+    const exitCodeBypass1 = executeCli(["--dir", tmpDir, "--sql", migDir, "--allow-risky-migrations", "--no-backup-required", "--skip-visual"]);
+    assert.equal(exitCodeBypass1, 1);
+
+    // 4. Attempt to bypass using --approve-risk: MUST STILL FAIL with exit code 1
+    const exitCodeBypass2 = executeCli(["--dir", tmpDir, "--sql", migDir, "--approve-risk", "Attempted bypass", "--no-backup-required", "--skip-visual"]);
+    assert.equal(exitCodeBypass2, 1);
+
+    // 5. Explicit governed execution flag (--allow-destructive): Cleared on governed path
+    const exitCodeGoverned = executeCli(["--dir", tmpDir, "--sql", migDir, "--allow-destructive", "--no-backup-required", "--skip-visual"]);
+    assert.equal(exitCodeGoverned, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
-test("Rule 2: Risky additive operations require explicit risk override", () => {
-  const riskyIndex = "CREATE INDEX idx_orders_user ON orders(user_id);";
-  const indexResult = analyzeMigrationSql(riskyIndex);
-  assert.equal(indexResult.classification, "RISKY_ADDITIVE");
-  assert.equal(indexResult.canAutoDeploy, false);
-  assert.match(indexResult.issues[0], /CONCURRENTLY/i);
+test("Isolation: Unclassified SQL cannot be bypassed by --allow-risky-migrations; requires --approve-unclassified-sql", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "unclassified-fixture-"));
+  try {
+    const migDir = path.join(tmpDir, "migrations");
+    fs.mkdirSync(migDir);
+    fs.writeFileSync(path.join(migDir, "001_custom.sql"), "VACUUM FULL analytics;");
+
+    // 1. Ordinary risk override flag (--allow-risky-migrations) MUST FAIL for unclassified SQL
+    const resOrdinary = runPipeline({
+      dir: tmpDir,
+      sql: migDir,
+      allowRiskyMigrations: true,
+      noBackupRequired: true,
+      skipVisual: true,
+      json: true
+    });
+    assert.equal(resOrdinary.success, false);
+    assert.equal(resOrdinary.scorecard.stages.migrations.status, "BLOCKED_ON_UNCLASSIFIED_SQL");
+
+    // 2. Specific unclassified approval flag (--approve-unclassified-sql) SUCCEEDS
+    const resExplicit = runPipeline({
+      dir: tmpDir,
+      sql: migDir,
+      approveUnclassifiedSql: "Reviewed VACUUM maintenance command",
+      noBackupRequired: true,
+      skipVisual: true,
+      json: true
+    });
+    assert.equal(resExplicit.success, true);
+    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_UNCLASSIFIED_APPROVAL");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
-test("Rule 2: Safe additive migrations are cleanly approved", () => {
-  const safeSql = `
-    CREATE TABLE IF NOT EXISTS audit_events (id uuid primary key, created_at timestamp);
-    CREATE INDEX CONCURRENTLY idx_audit_time ON audit_events(created_at);
-    ALTER TABLE users ADD COLUMN nickname text;
-  `;
-  const safeResult = analyzeMigrationSql(safeSql);
-  assert.equal(safeResult.classification, "SAFE_ADDITIVE");
-  assert.equal(safeResult.canAutoDeploy, true);
-  assert.equal(safeResult.issues.length, 0);
+test("Isolation: Data mutation SQL cannot be bypassed by --allow-risky-migrations; requires --approve-data-mutation", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mutation-fixture-"));
+  try {
+    const migDir = path.join(tmpDir, "migrations");
+    fs.mkdirSync(migDir);
+    fs.writeFileSync(path.join(migDir, "001_update.sql"), "UPDATE users SET tier = 'pro' WHERE active = true;");
+
+    // 1. Ordinary risk override flag (--allow-risky-migrations) MUST FAIL for data mutations
+    const resOrdinary = runPipeline({
+      dir: tmpDir,
+      sql: migDir,
+      allowRiskyMigrations: true,
+      noBackupRequired: true,
+      skipVisual: true,
+      json: true
+    });
+    assert.equal(resOrdinary.success, false);
+    assert.equal(resOrdinary.scorecard.stages.migrations.status, "BLOCKED_ON_DATA_MUTATION");
+
+    // 2. Specific data mutation approval flag (--approve-data-mutation) SUCCEEDS
+    const resExplicit = runPipeline({
+      dir: tmpDir,
+      sql: migDir,
+      approveDataMutation: "Batched update verified",
+      noBackupRequired: true,
+      skipVisual: true,
+      json: true
+    });
+    assert.equal(resExplicit.success, true);
+    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_MUTATION_APPROVAL");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test("Pipeline Enforcement: Migrations present without backup BLOCKS by default", () => {

@@ -211,17 +211,101 @@ export function verifyBackup(backupPath, options = {}) {
 }
 
 /**
- * Split raw SQL into individual statements, stripping comments and handling whitespace
+ * Robust Character-State SQL Tokenizer
+ * Correctly splits SQL statements on semicolons outside of single quotes,
+ * double quotes, backticks, and comments. Preserves semicolons and comment
+ * tokens within string literals.
  */
 export function splitSqlStatements(sqlText) {
-  const cleanSql = sqlText
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const statements = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  let inLineComment = false;
+  let inBlockComment = false;
 
-  return cleanSql
-    .split(";")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  for (let i = 0; i < sqlText.length; i++) {
+    const ch = sqlText[i];
+    const nextCh = sqlText[i + 1] || "";
+
+    // Handle single-line comments (-- ...)
+    if (inLineComment) {
+      if (ch === "\n" || ch === "\r") {
+        inLineComment = false;
+      }
+      continue;
+    }
+
+    // Handle multi-line block comments (/* ... */)
+    if (inBlockComment) {
+      if (ch === "*" && nextCh === "/") {
+        inBlockComment = false;
+        i++; // skip '/'
+      }
+      continue;
+    }
+
+    // Check for comment starts outside string literals and identifiers
+    if (!inSingleQuote && !inDoubleQuote && !inBacktick) {
+      if (ch === "-" && nextCh === "-") {
+        inLineComment = true;
+        i++; // skip second '-'
+        continue;
+      }
+      if (ch === "/" && nextCh === "*") {
+        inBlockComment = true;
+        i++; // skip '*'
+        continue;
+      }
+    }
+
+    // Handle single-quote string literal ('...')
+    if (ch === "'" && !inDoubleQuote && !inBacktick) {
+      if (inSingleQuote && nextCh === "'") {
+        // Escaped quote in SQL standard ('')
+        current += "''";
+        i++; // skip escaped quote
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+      current += ch;
+      continue;
+    }
+
+    // Handle double-quote identifier ("...")
+    if (ch === '"' && !inSingleQuote && !inBacktick) {
+      inDoubleQuote = !inDoubleQuote;
+      current += ch;
+      continue;
+    }
+
+    // Handle backtick identifier (`...`)
+    if (ch === "`" && !inSingleQuote && !inDoubleQuote) {
+      inBacktick = !inBacktick;
+      current += ch;
+      continue;
+    }
+
+    // Handle statement delimiter (;) strictly outside literals/identifiers
+    if (ch === ";" && !inSingleQuote && !inDoubleQuote && !inBacktick) {
+      const trimmed = current.trim();
+      if (trimmed.length > 0) {
+        statements.push(trimmed);
+      }
+      current = "";
+      continue;
+    }
+
+    current += ch;
+  }
+
+  const finalTrimmed = current.trim();
+  if (finalTrimmed.length > 0) {
+    statements.push(finalTrimmed);
+  }
+
+  return statements;
 }
 
 /**
@@ -279,11 +363,13 @@ export function analyzeMigrationSql(sqlText) {
   ];
 
   for (const stmt of statements) {
+    // Strip string literals when checking DDL structure keywords so values like 'drop table' inside quotes do not false-trigger
+    const structureOnly = stmt.replace(/'(?:''|[^'])*'/g, "''");
     let stmtMatched = false;
 
     // 1. Check Destructive
     for (const rule of destructiveRules) {
-      if (rule.pattern.test(stmt)) {
+      if (rule.pattern.test(structureOnly)) {
         issues.push(rule.message);
         classification = "DESTRUCTIVE";
         requiresGovernedApproval = true;
@@ -296,7 +382,7 @@ export function analyzeMigrationSql(sqlText) {
 
     // 2. Check Data Mutation
     for (const rule of mutationRules) {
-      if (rule.pattern.test(stmt)) {
+      if (rule.pattern.test(structureOnly)) {
         issues.push(rule.message);
         if (classification !== "DESTRUCTIVE") {
           classification = "DATA_MUTATION_RISK";
@@ -310,7 +396,7 @@ export function analyzeMigrationSql(sqlText) {
 
     // 3. Check Risky Additive
     for (const rule of riskyAdditiveRules) {
-      if (rule.pattern.test(stmt)) {
+      if (rule.pattern.test(structureOnly)) {
         issues.push(rule.message);
         if (classification !== "DESTRUCTIVE" && classification !== "DATA_MUTATION_RISK") {
           classification = "RISKY_ADDITIVE";
@@ -324,7 +410,7 @@ export function analyzeMigrationSql(sqlText) {
 
     // 4. Check Safe Additive Whitelist
     for (const pattern of safePatterns) {
-      if (pattern.test(stmt)) {
+      if (pattern.test(structureOnly)) {
         stmtMatched = true;
         break;
       }
@@ -455,12 +541,15 @@ Usage:
 
 Options:
   --dir <path>                   Target repository root (default: current working directory)
-  --version <tag>                Release version tag (e.g. v1.2.0)
+  --version <tag>                Release version tag (e.g. v1.4.0)
   --require-prior-art            Enforce mandatory RESEARCH-BRIEF.md existence and verification
   --sql <file-or-dir>            Inspect SQL migration file or directory against Fail-Closed Risk Matrix
   --backup <file>                Verify backup artifact existence and gzip/SQL archive integrity
   --allow-risky-migrations       Explicitly acknowledge and permit Tier 2 risky additive migrations
-  --approve-risk <justification> Explicitly record operator approval note for risky migrations
+  --approve-risk <justification> Explicitly record operator approval note for risky additive migrations
+  --approve-data-mutation <note> Explicitly approve data mutation / backfill operations
+  --approve-unclassified-sql <n> Explicitly approve unrecognized / unclassified SQL statements
+  --allow-destructive            Permit destructive migration execution (requires governed path)
   --no-backup-required           Explicitly waive mandatory backup requirement for stateless deployments
   --skip-visual                  Skip visual sensory audit (for backend-only or non-UI repos)
   --html <file>                  Specific HTML file for visual audit (default: auto-detect)
@@ -480,6 +569,9 @@ export function parseArgs(args) {
     backup: "",
     allowRiskyMigrations: false,
     approveRisk: "",
+    approveDataMutation: "",
+    approveUnclassifiedSql: "",
+    allowDestructive: false,
     noBackupRequired: false,
     skipVisual: false,
     html: "",
@@ -508,6 +600,12 @@ export function parseArgs(args) {
     } else if (arg === "--approve-risk" && i + 1 < args.length) {
       options.approveRisk = args[++i];
       options.allowRiskyMigrations = true;
+    } else if (arg === "--approve-data-mutation" && i + 1 < args.length) {
+      options.approveDataMutation = args[++i];
+    } else if (arg === "--approve-unclassified-sql" && i + 1 < args.length) {
+      options.approveUnclassifiedSql = args[++i];
+    } else if (arg === "--allow-destructive") {
+      options.allowDestructive = true;
     } else if (arg === "--no-backup-required") {
       options.noBackupRequired = true;
     } else if (arg === "--skip-visual") {
@@ -723,27 +821,70 @@ export function runPipeline(options) {
 
     // Inspect migrations if found
     if (migrationReport.hasMigrations) {
+      // 1. DESTRUCTIVE: Unconditional block on standard path
       if (migrationReport.classification === "DESTRUCTIVE") {
-        scorecard.stages.migrations.status = "GOVERNED_APPROVAL_REQUIRED";
-        scorecard.stages.migrations.details = `Destructive SQL detected (${migrationReport.issues.length} flags). Standard path BLOCKED. Requires restore-rehearsed backup and human execution.`;
-        if (!options.json) {
-          console.error("[Data Safety Gate] DESTRUCTIVE MIGRATION BLOCKED on standard path:");
-          for (const issue of migrationReport.issues) {
-            console.error(`  - ${issue}`);
+        if (!options.allowDestructive) {
+          scorecard.stages.migrations.status = "GOVERNED_APPROVAL_REQUIRED";
+          scorecard.stages.migrations.details = `Destructive SQL detected (${migrationReport.issues.length} flags). Standard path BLOCKED. Cannot be overridden by ordinary risk review flags. Requires governed path.`;
+          if (!options.json) {
+            console.error("[Data Safety Gate] DESTRUCTIVE MIGRATION BLOCKED on standard path:");
+            for (const issue of migrationReport.issues) {
+              console.error(`  - ${issue}`);
+            }
+            console.error("\nCRITICAL: Destructive migrations cannot be overridden by --allow-risky-migrations or --approve-risk.");
           }
+          return { success: false, scorecard };
+        } else {
+          scorecard.stages.migrations.status = "PASSED_WITH_GOVERNED_APPROVAL";
+          scorecard.stages.migrations.details = "Destructive migrations permitted under explicit governed execution flag.";
         }
-        return { success: false, scorecard };
-      } else if (
-        migrationReport.classification === "RISKY_ADDITIVE" ||
-        migrationReport.classification === "DATA_MUTATION_RISK" ||
-        migrationReport.classification === "REVIEW_REQUIRED"
-      ) {
-        // Enforce risk-review outcome: FAIL by default unless explicitly approved
+      }
+
+      // 2. DATA MUTATION: Unbatched update/delete backfills
+      else if (migrationReport.classification === "DATA_MUTATION_RISK") {
+        if (!options.approveDataMutation) {
+          scorecard.stages.migrations.status = "BLOCKED_ON_DATA_MUTATION";
+          scorecard.stages.migrations.details = `Data mutation SQL detected (${migrationReport.issues.length} flags). Autonomous rollout BLOCKED. Pass --approve-data-mutation "<justification>" to proceed.`;
+          if (!options.json) {
+            console.error("[Data Safety Gate] DATA MUTATION RISK DETECTED (unbatched updates/backfills):");
+            for (const issue of migrationReport.issues) {
+              console.error(`  - ${issue}`);
+            }
+            console.error("\nPass --approve-data-mutation \"<justification>\" to acknowledge.");
+          }
+          return { success: false, scorecard };
+        } else {
+          scorecard.stages.migrations.status = "PASSED_WITH_MUTATION_APPROVAL";
+          scorecard.stages.migrations.details = `Data mutation acknowledged by operator: ${options.approveDataMutation}`;
+        }
+      }
+
+      // 3. UNCLASSIFIED / UNRECOGNIZED SQL: Fail-Closed
+      else if (migrationReport.classification === "REVIEW_REQUIRED") {
+        if (!options.approveUnclassifiedSql) {
+          scorecard.stages.migrations.status = "BLOCKED_ON_UNCLASSIFIED_SQL";
+          scorecard.stages.migrations.details = `Unrecognized SQL detected (${migrationReport.issues.length} flags). Autonomous rollout BLOCKED. Cannot be bypassed by ordinary --allow-risky-migrations. Pass --approve-unclassified-sql "<justification>" to proceed.`;
+          if (!options.json) {
+            console.error("[Data Safety Gate] UNRECOGNIZED SQL DETECTED (Fail-Closed):");
+            for (const issue of migrationReport.issues) {
+              console.error(`  - ${issue}`);
+            }
+            console.error("\nPass --approve-unclassified-sql \"<justification>\" to explicitly approve.");
+          }
+          return { success: false, scorecard };
+        } else {
+          scorecard.stages.migrations.status = "PASSED_WITH_UNCLASSIFIED_APPROVAL";
+          scorecard.stages.migrations.details = `Unclassified SQL acknowledged by operator: ${options.approveUnclassifiedSql}`;
+        }
+      }
+
+      // 4. RISKY ADDITIVE: Exclusive table locks / defaults on older engines
+      else if (migrationReport.classification === "RISKY_ADDITIVE") {
         if (!options.allowRiskyMigrations) {
           scorecard.stages.migrations.status = "BLOCKED_ON_RISK_REVIEW";
-          scorecard.stages.migrations.details = `Operationally risky or unclassified SQL detected (${migrationReport.issues.length} flags). Autonomous rollout BLOCKED. Pass --allow-risky-migrations or --approve-risk "<note>" after locking analysis.`;
+          scorecard.stages.migrations.details = `Operationally risky additive SQL detected (${migrationReport.issues.length} flags). Autonomous rollout BLOCKED. Pass --allow-risky-migrations or --approve-risk "<note>" after locking analysis.`;
           if (!options.json) {
-            console.error(`[Data Safety Gate] BLOCKED ON RISK REVIEW (${migrationReport.classification}):`);
+            console.error("[Data Safety Gate] BLOCKED ON RISK REVIEW (Risky Additive):");
             for (const issue of migrationReport.issues) {
               console.error(`  - ${issue}`);
             }
@@ -757,7 +898,10 @@ export function runPipeline(options) {
             console.warn(`[Data Safety Gate] PASSED WITH RISK OVERRIDE (${options.approveRisk || "explicit flag"}).`);
           }
         }
-      } else {
+      }
+
+      // 5. SAFE ADDITIVE: Whitelisted safe statements
+      else {
         scorecard.stages.migrations.status = "PASSED";
         scorecard.stages.migrations.details = `Safe additive migrations verified (${migrationReport.filesCount} files).`;
         if (!options.json) {

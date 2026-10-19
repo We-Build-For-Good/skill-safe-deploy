@@ -13,7 +13,7 @@ It chains deterministic verification gates of our autonomous studio into a singl
 1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Verifies evidence-backed research and build decisions before shipping.
 2. **Gate 1: System Invariants Engine (`wb4g-invariants`)**: Enforces character invariants (zero em dashes), Prettier legibility, brand boundaries, and file bounds. Reports `PASSED` or `FALLBACK_PASSED` honestly.
 3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Drives headless Chrome across 375px, 768px, and 1440px viewports to detect layout blowouts, broken media, touch collisions, and console errors.
-4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations against the Fail-Closed Database Risk Matrix. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Blocks on unresolved risky statements.
+4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations using a character-state tokenizer. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Isolated override flags per category: destructive migrations cannot be overridden by ordinary risk flags.
 5. **Gate 4: Release & Broadcast Packaging (`wb4g-broadcast`)**: Compiles git commits into manifests, changelogs, and staged customer announcement drafts. Reports `PASSED` or `STANDALONE_STAGED` honestly.
 6. **Gate 5: Integrity Digest & Infrastructure Authorization Boundary (Rule 5)**: Mechanically holds irreversible production deployments and broadcast transmissions. Computes an immutable SHA-256 integrity digest binding git commit SHA and migration file contents. Enforces authorization via external CI/CD infrastructure gates.
 
@@ -28,7 +28,7 @@ Install locally or run via node:
 node bin/safe-deploy.mjs
 
 # Run pipeline with explicit version tag and changelog update
-node bin/safe-deploy.mjs --version v1.3.0 --update-changelog
+node bin/safe-deploy.mjs --version v1.4.0 --update-changelog
 
 # Run pipeline enforcing prior-art brief existence
 node bin/safe-deploy.mjs --require-prior-art
@@ -38,6 +38,12 @@ node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz
 
 # Run pipeline acknowledging Tier 2 risky additive migrations
 node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-risk "Locking verified on staging"
+
+# Run pipeline acknowledging unbatched data mutations / backfills
+node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-data-mutation "Batched in 500 row chunks"
+
+# Run pipeline acknowledging unrecognized / custom procedural SQL
+node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-unclassified-sql "Reviewed PL/pgSQL function"
 
 # Explicitly waive backup for stateless repositories
 node bin/safe-deploy.mjs --no-backup-required
@@ -57,12 +63,13 @@ node bin/safe-deploy.mjs --json
    - Mandatory backup verification whenever SQL migrations exist.
    - Decompresses gzip payloads to verify archive integrity (not just magic bytes).
    - Validates non-empty file format and strict exit codes (`set -o pipefail`).
-2. **Guard the One Door You Cannot Reopen (Fail-Closed Risk Matrix)**:
+2. **Guard the One Door You Cannot Reopen (Isolated Risk Boundaries)**:
    - Additive does not mean safe.
    - Tier 1 (Safe Additive): `CREATE TABLE`, `CREATE INDEX CONCURRENTLY`, nullable columns without locks.
-   - Tier 2 (Risky Additive & Mutation): `CREATE INDEX` without `CONCURRENTLY`, non-null defaults on older engines, unbatched `DELETE`/`UPDATE` mutations. Blocks pipeline by default until explicit operator review is recorded.
-   - Tier 3 (Destructive): `DROP`, `TRUNCATE`, `ALTER COLUMN TYPE`, `SET NOT NULL` on populated tables. Blocks standard path; requires governed approval.
-   - Fail-Closed: Unrecognized SQL statements default to `REVIEW_REQUIRED` and block autonomous progression.
+   - Tier 2 (Risky Additive): `CREATE INDEX` without `CONCURRENTLY`, non-null defaults on older engines. Blocks pipeline by default; requires `--allow-risky-migrations` or `--approve-risk`.
+   - Data Mutation Risk: Unbatched `UPDATE ... SET` or `INSERT ... SELECT`. Cannot be bypassed by ordinary risk flags; requires `--approve-data-mutation`.
+   - Unclassified SQL: Defaults to `REVIEW_REQUIRED`. Cannot be bypassed by ordinary risk flags; requires `--approve-unclassified-sql`.
+   - Tier 3 (Destructive): `DROP`, `TRUNCATE`, `ALTER COLUMN TYPE`, `DELETE FROM`, `SET NOT NULL` on populated tables. Unconditionally exits non-zero (`GOVERNED_APPROVAL_REQUIRED`). Cannot be overridden by ordinary risk-review flags.
 3. **One Step at a Time, In Order (Phased Rollout & Post-Deploy Verification)**:
    - Deploy backend/data tier first; verify deep readiness (DB, Redis, workers).
    - Deploy frontend tier second.
@@ -101,7 +108,7 @@ git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git ~/.claude/s
 
 ## Automated Test Suite
 
-Runs standalone in any clean clone with zero external dependencies, covering all failure and adversarial paths:
+Runs standalone in any clean clone with zero external dependencies, covering all failure, adversarial, and isolated override paths:
 
 ```bash
 node --test test/*.test.mjs

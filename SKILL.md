@@ -1,10 +1,10 @@
 ---
 name: safe-deploy
-description: "Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, fail-closed migration risk analysis, and release packaging into an automated scorecard with cryptographic integrity digests."
+description: "Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, fail-closed migration risk analysis with isolated override boundaries, and release packaging into an automated scorecard with cryptographic integrity digests."
 license: MIT
 metadata:
   author: We Build for Good
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # Safe Deploy: The Production Release Protocol & Unified Pipeline (wb4g-pipeline)
@@ -33,20 +33,26 @@ When preparing any release, execute the automated verification pipeline:
 
 ```bash
 # Run full studio delivery pipeline
-node bin/safe-deploy.mjs --dir /path/to/repo --version v1.3.0
+node bin/safe-deploy.mjs --dir /path/to/repo --version v1.4.0
 
 # Run pipeline with migration inspection and backup artifact verification
 node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz
 
-# Run pipeline with explicit risk review acknowledgment for Tier 2 migrations
+# Run pipeline acknowledging Tier 2 risky additive migrations
 node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-risk "Locking verified on 1M row staging DB"
+
+# Run pipeline acknowledging unbatched data mutations / backfills
+node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-data-mutation "Batched in 500 row chunks"
+
+# Run pipeline acknowledging unrecognized / custom procedural SQL
+node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-unclassified-sql "Reviewed PL/pgSQL function"
 ```
 
 The runner chains:
 1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Validates `RESEARCH-BRIEF.md` to ensure prior art was investigated before custom code was built.
 2. **Gate 1: System Invariants (`wb4g-invariants`)**: Mechanical verification of character invariants (zero em dashes), Prettier legibility, file bounds, and brand boundaries. Reports `PASSED` or `FALLBACK_PASSED` transparently based on environment capabilities.
 3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Headless Chrome verification across 375px, 768px, and 1440px viewports (catching layout blowouts, broken assets, and runtime errors).
-4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations against the Fail-Closed Database Risk Matrix. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Blocks on unresolved risky statements.
+4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations using a character-state tokenizer. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Enforces isolated override boundaries per risk category. Destructive migrations cannot be overridden by ordinary risk flags.
 5. **Gate 4: Release Packaging (`wb4g-broadcast`)**: Compiles landed git commits into release manifests, categorized changelogs, and staged broadcast copy. Reports `PASSED` or `STANDALONE_STAGED` transparently.
 6. **Gate 5: Integrity Digest & Infrastructure Authorization Boundary**: Binds git commit SHA, migration file content hashes, and gate results into an immutable SHA-256 integrity digest. Freezes irreversible actions for external infrastructure authorization.
 
@@ -63,26 +69,30 @@ If the deploy touches persistent data, take a fresh database backup and prove it
 * **Level 3 (Restoration Rehearsal)**: For releases involving destructive schema modifications, verify that the backup can be successfully restored into a disposable, ephemeral database before touching production.
 * Skip this rule only when the release genuinely touches zero persistent data (waived explicitly via `--no-backup-required`).
 
-### Rule 2: Guard the One Door You Cannot Reopen (Fail-Closed Risk Matrix)
+### Rule 2: Guard the One Door You Cannot Reopen (Isolated Risk Boundaries)
 
-Additive does not automatically mean safe, and unclassified SQL cannot be assumed benign. The engine evaluates individual statements fail-closed:
+Additive does not automatically mean safe, and unclassified SQL cannot be assumed benign. The engine tokenizes SQL statements respecting quotes and comments, and partitions safety into strict isolated boundaries:
 
 * **Tier 1: Safe Additive (Standard Path Cleared)**:
   * `CREATE TABLE` without foreign keys to heavily populated tables.
   * `CREATE INDEX CONCURRENTLY` (Postgres) or `ALGORITHM=INPLACE, LOCK=NONE` (MySQL).
   * `ADD COLUMN` nullable without defaults or with constant defaults on modern engines.
-* **Tier 2: Risky Additive & Data Mutation (Enforced Review Gate)**:
+* **Tier 2: Risky Additive (Enforced Risk Review Gate)**:
   * `CREATE INDEX` without `CONCURRENTLY`: Takes exclusive write locks on the target table during build.
   * `ADD COLUMN` with volatile defaults: Can trigger full table rewrites under an exclusive lock.
-  * `UPDATE ... SET` or `INSERT INTO ... SELECT`: Data mutations and unbatched backfills.
-  * **ENFORCEMENT**: Unresolved Tier 2 migrations block the pipeline with non-zero exit codes. Rollout proceeds only when an explicit operator review is recorded (`--allow-risky-migrations` or `--approve-risk "<justification>"`).
+  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Permitted only with explicit operator acknowledgment: `--allow-risky-migrations` or `--approve-risk "<justification>"`.
+* **Data Mutation Risk (Enforced Mutation Gate)**:
+  * `UPDATE ... SET` or `INSERT INTO ... SELECT`: Data mutations and bulk unbatched backfills.
+  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Cannot be bypassed by `--allow-risky-migrations`. Requires explicit `--approve-data-mutation "<justification>"`.
+* **Unclassified SQL (Fail-Closed Review Gate)**:
+  * Any statement not matching an explicit safe whitelist (e.g. `MERGE INTO`, `VACUUM FULL`, procedural blocks) defaults to `REVIEW_REQUIRED`.
+  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Cannot be bypassed by ordinary risk flags. Requires explicit `--approve-unclassified-sql "<justification>"`.
 * **Tier 3: Destructive (Governed Path Required)**:
   * `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, `ALTER TABLE ... DROP`.
   * Column type rewrites (`ALTER COLUMN ... TYPE`).
   * `DELETE FROM` (unbatched data deletion).
   * `SET NOT NULL` on populated tables without prior check constraints.
-  * **STOP.** Tier 3 requires the governed path: a Level 3 restore-rehearsed backup, staged expand-and-contract handling, and explicit human authorization.
-* **Fail-Closed Unrecognized SQL**: Any statement not matching an explicit safe whitelist defaults to `REVIEW_REQUIRED` and blocks autonomous progression.
+  * **CRITICAL ENFORCEMENT**: Destructive migrations unconditionally exit with non-zero status (`GOVERNED_APPROVAL_REQUIRED`). They CANNOT be overridden by `--allow-risky-migrations` or `--approve-risk`. Permitted only on the governed path with `--allow-destructive` and a Level 3 restore-rehearsed backup.
 
 ### Rule 3: One Step at a Time, In Order (Phased Rollout & Post-Deploy Verification)
 
