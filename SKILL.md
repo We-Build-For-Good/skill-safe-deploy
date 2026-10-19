@@ -1,10 +1,10 @@
 ---
 name: safe-deploy
-description: "Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, migration risk analysis, and release packaging into an automated scorecard with cryptographic human sign-off."
+description: "Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, fail-closed migration risk analysis, and release packaging into an automated scorecard with cryptographic integrity digests."
 license: MIT
 metadata:
   author: We Build for Good
-  version: "1.2.0"
+  version: "1.3.0"
 ---
 
 # Safe Deploy: The Production Release Protocol & Unified Pipeline (wb4g-pipeline)
@@ -33,52 +33,56 @@ When preparing any release, execute the automated verification pipeline:
 
 ```bash
 # Run full studio delivery pipeline
-node bin/safe-deploy.mjs --dir /path/to/repo --version v1.2.0
+node bin/safe-deploy.mjs --dir /path/to/repo --version v1.3.0
 
 # Run pipeline with migration inspection and backup artifact verification
 node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz
+
+# Run pipeline with explicit risk review acknowledgment for Tier 2 migrations
+node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-risk "Locking verified on 1M row staging DB"
 ```
 
 The runner chains:
 1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Validates `RESEARCH-BRIEF.md` to ensure prior art was investigated before custom code was built.
-2. **Gate 1: System Invariants (`wb4g-invariants`)**: Mechanical verification of character invariants (zero em dashes), Prettier legibility, file bounds, and brand boundaries.
+2. **Gate 1: System Invariants (`wb4g-invariants`)**: Mechanical verification of character invariants (zero em dashes), Prettier legibility, file bounds, and brand boundaries. Reports `PASSED` or `FALLBACK_PASSED` transparently based on environment capabilities.
 3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Headless Chrome verification across 375px, 768px, and 1440px viewports (catching layout blowouts, broken assets, and runtime errors).
-4. **Gate 3: Migration Risk & Data Safety Gate**: Static analysis of SQL migrations against the Three-Tier Database Risk Matrix, and backup header/byte assurance.
-5. **Gate 4: Release Packaging (`wb4g-broadcast`)**: Compiles landed git commits into release manifests, categorized changelogs, and staged broadcast copy.
-6. **Gate 5: Enforceable Human Barrier & Cryptographic Fingerprint**: Generates an immutable SHA-256 scorecard token and freezes irreversible actions until human authorization.
+4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations against the Fail-Closed Database Risk Matrix. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Blocks on unresolved risky statements.
+5. **Gate 4: Release Packaging (`wb4g-broadcast`)**: Compiles landed git commits into release manifests, categorized changelogs, and staged broadcast copy. Reports `PASSED` or `STANDALONE_STAGED` transparently.
+6. **Gate 5: Integrity Digest & Infrastructure Authorization Boundary**: Binds git commit SHA, migration file content hashes, and gate results into an immutable SHA-256 integrity digest. Freezes irreversible actions for external infrastructure authorization.
 
 ---
 
 ## The Five Safety Rules (In Strict Order)
 
-### Rule 1: Take a Photo First (Backup Assurance Levels)
+### Rule 1: Take a Photo First (Backup Assurance & Mandatory Gate)
 
-If the deploy touches persistent data, take a fresh database backup and prove it is valid before anything else moves. A non-empty dump is not proof of a usable backup; verify backup assurance explicitly:
+If the deploy touches persistent data, take a fresh database backup and prove it is valid before anything else moves. When SQL migrations are detected, backup verification is mandatory by default:
 
-* **Level 1 (Exit Code & Stream Integrity)**: Ensure dump commands run with strict error capture (`set -o pipefail`). Verify the process exited cleanly with code 0.
+* **Level 1 (Stream Integrity & Archive Decompression)**: Ensure dump commands run with strict error capture (`set -o pipefail`). For gzip archives, verify full archive integrity via payload decompression to catch premature truncation or CRC corruption after the header.
 * **Level 2 (Target Verification & Non-Empty Artifact)**: Verify the backup targets the intended production database and host, not an empty local sandbox. Inspect file size and format headers (SQL statements, gzip magic bytes, or tar headers). A tiny byte count is an immediate red flag.
-* **Level 3 (Restoration Rehearsal)**: For releases involving destructive or complex schema modifications, verify that the backup can be successfully restored into a disposable, ephemeral database before touching production.
-* Skip this rule only when the release genuinely touches zero persistent data.
+* **Level 3 (Restoration Rehearsal)**: For releases involving destructive schema modifications, verify that the backup can be successfully restored into a disposable, ephemeral database before touching production.
+* Skip this rule only when the release genuinely touches zero persistent data (waived explicitly via `--no-backup-required`).
 
-### Rule 2: Guard the One Door You Cannot Reopen (Three-Tier Migration Risk)
+### Rule 2: Guard the One Door You Cannot Reopen (Fail-Closed Risk Matrix)
 
-Additive does not automatically mean safe. Before shipping any migration, inspect the raw SQL against the Three-Tier Database Risk Matrix:
+Additive does not automatically mean safe, and unclassified SQL cannot be assumed benign. The engine evaluates individual statements fail-closed:
 
 * **Tier 1: Safe Additive (Standard Path Cleared)**:
   * `CREATE TABLE` without foreign keys to heavily populated tables.
   * `CREATE INDEX CONCURRENTLY` (Postgres) or `ALGORITHM=INPLACE, LOCK=NONE` (MySQL).
-  * `ADD COLUMN` nullable without defaults or with constant defaults on modern engines (Postgres 11+, MySQL 8.0.12+).
-* **Tier 2: Risky Additive (Operational Risk Review Required)**:
+  * `ADD COLUMN` nullable without defaults or with constant defaults on modern engines.
+* **Tier 2: Risky Additive & Data Mutation (Enforced Review Gate)**:
   * `CREATE INDEX` without `CONCURRENTLY`: Takes exclusive write locks on the target table during build.
-  * `ADD COLUMN` with volatile defaults or on older database engines: Can trigger full table rewrites under an exclusive lock.
-  * `ADD CONSTRAINT ... FOREIGN KEY` without `NOT VALID`: Scans the entire table holding a share lock.
-  * Adding nullable columns that break backward serialization compatibility with older running application versions.
+  * `ADD COLUMN` with volatile defaults: Can trigger full table rewrites under an exclusive lock.
+  * `UPDATE ... SET` or `INSERT INTO ... SELECT`: Data mutations and unbatched backfills.
+  * **ENFORCEMENT**: Unresolved Tier 2 migrations block the pipeline with non-zero exit codes. Rollout proceeds only when an explicit operator review is recorded (`--allow-risky-migrations` or `--approve-risk "<justification>"`).
 * **Tier 3: Destructive (Governed Path Required)**:
   * `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, `ALTER TABLE ... DROP`.
   * Column type rewrites (`ALTER COLUMN ... TYPE`).
+  * `DELETE FROM` (unbatched data deletion).
   * `SET NOT NULL` on populated tables without prior check constraints.
-  * Unbatched bulk data updates or backfills.
   * **STOP.** Tier 3 requires the governed path: a Level 3 restore-rehearsed backup, staged expand-and-contract handling, and explicit human authorization.
+* **Fail-Closed Unrecognized SQL**: Any statement not matching an explicit safe whitelist defaults to `REVIEW_REQUIRED` and blocks autonomous progression.
 
 ### Rule 3: One Step at a Time, In Order (Phased Rollout & Post-Deploy Verification)
 
@@ -102,6 +106,6 @@ Additive does not automatically mean safe. Before shipping any migration, inspec
 
 The AI delegates preparation, staging, and verification. The human retains execution authority over irreversible actions.
 
-* **Enforceable Boundary**: Prompt instructions are not security boundaries. The AI execution environment must operate with least-privilege credentials, strictly isolated from production deployment keys and write credentials.
-* **Cryptographic Scorecard**: The pipeline outputs an immutable SHA-256 approval token. Production deployment scripts or CI/CD environments require this verified token or manual approval gates before applying changes.
+* **Integrity vs Authorization**: The pipeline computes an immutable SHA-256 `integrityDigest` that binds the exact git commit SHA, migration file contents, and verification gate results. This fingerprint proves artifact integrity; it is not an authorization grant.
+* **Infrastructure Authorization**: The AI agent operates with least-privilege credentials, strictly isolated from production deployment keys and write credentials. Actual authorization must be enforced via external infrastructure boundaries (e.g. GitHub Environment Protection Rules with required human approvers or manual CI/CD deploy jobs).
 * Preparation is delegated. Irreversibility is not.

@@ -18,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -71,7 +72,7 @@ function runTool(toolConfig, args, cwd) {
 
 /**
  * Fallback invariant scanner for standalone / clean-clone usage
- * Scans files for forbidden characters (em dash, en dash)
+ * Scans files for forbidden characters (em dash)
  */
 export function checkInvariantsFallback(targetDir) {
   const violations = [];
@@ -122,7 +123,8 @@ export function checkInvariantsFallback(targetDir) {
 
 /**
  * Rule 1: Backup Assurance Verifier
- * Verifies that a database backup exists, is non-empty, and has valid headers.
+ * Verifies that a database backup exists, is non-empty, and has verifiable archive integrity.
+ * For gzip archives, decompresses the payload to ensure no premature truncation or CRC errors.
  */
 export function verifyBackup(backupPath, options = {}) {
   const minBytes = options.minBytes || 1024;
@@ -150,29 +152,46 @@ export function verifyBackup(backupPath, options = {}) {
     };
   }
 
-  // Header and format integrity check
+  // Header and archive integrity check
   try {
-    const fd = fs.openSync(backupPath, "r");
-    const buffer = Buffer.alloc(Math.min(512, stat.size));
-    fs.readSync(fd, buffer, 0, buffer.length, 0);
-    fs.closeSync(fd);
+    const fileBuffer = fs.readFileSync(backupPath);
 
     if (backupPath.endsWith(".gz")) {
-      if (buffer[0] !== 0x1f || buffer[1] !== 0x8b) {
+      // 1. Magic bytes check
+      if (fileBuffer.length < 2 || fileBuffer[0] !== 0x1f || fileBuffer[1] !== 0x8b) {
         return {
           valid: false,
           size: stat.size,
           reason: "Corrupted gzip backup: invalid magic bytes."
         };
       }
+      // 2. Full decompression test to catch truncated or corrupted gzip payloads
+      try {
+        zlib.gunzipSync(fileBuffer);
+      } catch (gzipErr) {
+        return {
+          valid: false,
+          size: stat.size,
+          reason: `Corrupted or truncated gzip backup: ${gzipErr.message}`
+        };
+      }
     } else if (backupPath.endsWith(".sql")) {
-      const text = buffer.toString("utf8");
-      const hasSqlSignatures = /(--|CREATE|SET|INSERT|DROP|ALTER|BEGIN|\/\*)/i.test(text);
+      const headerText = fileBuffer.subarray(0, Math.min(512, fileBuffer.length)).toString("utf8");
+      const hasSqlSignatures = /(--|CREATE|SET|INSERT|DROP|ALTER|BEGIN|\/\*)/i.test(headerText);
       if (!hasSqlSignatures) {
         return {
           valid: false,
           size: stat.size,
           reason: "SQL backup missing standard SQL header or structure statements."
+        };
+      }
+      // Inspect footer for clean termination
+      const footerText = fileBuffer.subarray(Math.max(0, fileBuffer.length - 256)).toString("utf8");
+      if (footerText.trim().length === 0) {
+        return {
+          valid: false,
+          size: stat.size,
+          reason: "SQL backup ends with unexpected empty trailing block."
         };
       }
     }
@@ -187,71 +206,136 @@ export function verifyBackup(backupPath, options = {}) {
   return {
     valid: true,
     size: stat.size,
-    reason: "Backup verified: non-empty file with valid structure headers."
+    reason: "Backup verified: non-empty archive with verified integrity."
   };
 }
 
 /**
- * Rule 2: Database Migration Risk Classifier
- * Classifies migrations into:
- * - DESTRUCTIVE: Drops, truncates, type alters, NOT NULL without defaults on populated tables.
- * - RISKY_ADDITIVE: Index creation without CONCURRENTLY, columns with defaults, foreign keys without NOT VALID.
- * - SAFE_ADDITIVE: Create tables, concurrent indexes, nullable columns.
+ * Split raw SQL into individual statements, stripping comments and handling whitespace
+ */
+export function splitSqlStatements(sqlText) {
+  const cleanSql = sqlText
+    .replace(/--.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+
+  return cleanSql
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Rule 2: Fail-Closed Database Migration Risk Classifier
+ * Evaluates individual statements against strict safety rules.
+ * Defaults unclassified or unknown statements to REVIEW_REQUIRED.
  */
 export function analyzeMigrationSql(sqlText) {
+  const statements = splitSqlStatements(sqlText);
+  if (statements.length === 0) {
+    return {
+      classification: "NO_MIGRATIONS",
+      canAutoDeploy: true,
+      requiresGovernedApproval: false,
+      issues: []
+    };
+  }
+
   const issues = [];
   let classification = "SAFE_ADDITIVE";
   let requiresGovernedApproval = false;
   let canAutoDeploy = true;
 
-  // Strip SQL single-line and multi-line comments
-  const cleanSql = sqlText
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
-
-  // Destructive pattern definitions
+  // Destructive rules (loss of data or structural breaking changes)
   const destructiveRules = [
-    { pattern: /\bDROP\s+TABLE\b/i, message: "DROP TABLE detected (irreversible data loss)." },
-    { pattern: /\bDROP\s+COLUMN\b/i, message: "DROP COLUMN detected (irreversible schema mutation)." },
+    { pattern: /\bDROP\s+(?:TABLE|COLUMN|DATABASE|SCHEMA|VIEW|INDEX|SEQUENCE|TYPE)\b/i, message: "DROP statement detected (irreversible deletion)." },
     { pattern: /\bTRUNCATE\b/i, message: "TRUNCATE statement detected (full table erasure)." },
+    { pattern: /\bDELETE\s+FROM\b/i, message: "DELETE statement detected (data-changing deletion)." },
     { pattern: /\bALTER\s+TABLE\s+[\w\.\"]+\s+DROP\b/i, message: "ALTER TABLE DROP detected." },
     { pattern: /\bALTER\s+TABLE\s+[\w\.\"]+\s+ALTER\s+(?:COLUMN\s+)?[\w\.\"]+\s+TYPE\b/i, message: "Column type rewrite detected (table rewrite and locking risk)." },
     { pattern: /\bSET\s+NOT\s+NULL\b/i, message: "SET NOT NULL detected on existing column (fails if nulls exist; locks table during scan)." }
   ];
 
-  for (const rule of destructiveRules) {
-    if (rule.pattern.test(cleanSql)) {
-      issues.push(rule.message);
-      classification = "DESTRUCTIVE";
-      requiresGovernedApproval = true;
-      canAutoDeploy = false;
-    }
-  }
+  // Data mutation rules (bulk backfills and unbatched data changes)
+  const mutationRules = [
+    { pattern: /\bUPDATE\s+[\w\.\"]+\s+SET\b/i, message: "UPDATE statement detected (data mutation without batching controls)." },
+    { pattern: /\bINSERT\s+INTO\s+[\w\.\"]+\s+SELECT\b/i, message: "INSERT INTO ... SELECT detected (bulk unbatched backfill risk)." }
+  ];
 
-  // Risky Additive pattern definitions (operational locking risks)
-  if (classification !== "DESTRUCTIVE") {
-    const riskyRules = [
-      {
-        pattern: /\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+CONCURRENTLY\b)/i,
-        message: "CREATE INDEX without CONCURRENTLY detected (takes exclusive table lock on writes in Postgres)."
-      },
-      {
-        pattern: /\bADD\s+(?:COLUMN\s+)?[\w\.\"]+\s+[\w\(\)]+\s+DEFAULT\s+(?!NULL\b)[^;]+/i,
-        message: "ADD COLUMN with non-null default detected (risk of table rewrite and lock contention on older engines)."
-      },
-      {
-        pattern: /\bADD\s+CONSTRAINT\s+[\w\.\"]+\s+FOREIGN\s+KEY\b(?!\s+.*NOT\s+VALID)/i,
-        message: "ADD CONSTRAINT FOREIGN KEY without NOT VALID detected (scans table holding share lock)."
-      }
-    ];
+  // Risky Additive rules (table locks and operational hazards)
+  const riskyAdditiveRules = [
+    { pattern: /\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+CONCURRENTLY\b)/i, message: "CREATE INDEX without CONCURRENTLY detected (takes exclusive write lock on table in Postgres)." },
+    { pattern: /\bADD\s+(?:COLUMN\s+)?[\w\.\"]+\s+[\w\(\)]+\s+DEFAULT\s+(?!NULL\b)[^;]+/i, message: "ADD COLUMN with non-null default detected (risk of table rewrite and lock contention on older engines)." },
+    { pattern: /\bADD\s+CONSTRAINT\s+[\w\.\"]+\s+FOREIGN\s+KEY\b(?!\s+.*NOT\s+VALID)/i, message: "ADD CONSTRAINT FOREIGN KEY without NOT VALID detected (scans table holding share lock)." }
+  ];
 
-    for (const rule of riskyRules) {
-      if (rule.pattern.test(cleanSql)) {
+  // Safe Additive whitelist patterns
+  const safePatterns = [
+    /^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w\.\"]+/i,
+    /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/i,
+    /^\s*ALTER\s+TABLE\s+[\w\.\"]+\s+ADD\s+(?:COLUMN\s+)?[\w\.\"]+\s+[\w\(\)]+(?:\s+NULL)?$/i,
+    /^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/i,
+    /^\s*COMMENT\s+ON\b/i,
+    /^\s*(?:BEGIN|COMMIT|START\s+TRANSACTION|ROLLBACK|SET\s+[\w\.\"]+)/i
+  ];
+
+  for (const stmt of statements) {
+    let stmtMatched = false;
+
+    // 1. Check Destructive
+    for (const rule of destructiveRules) {
+      if (rule.pattern.test(stmt)) {
         issues.push(rule.message);
-        classification = "RISKY_ADDITIVE";
-        // Risky additive does not block deploy outright, but requires operational risk sign-off
+        classification = "DESTRUCTIVE";
+        requiresGovernedApproval = true;
         canAutoDeploy = false;
+        stmtMatched = true;
+        break;
       }
+    }
+    if (stmtMatched) continue;
+
+    // 2. Check Data Mutation
+    for (const rule of mutationRules) {
+      if (rule.pattern.test(stmt)) {
+        issues.push(rule.message);
+        if (classification !== "DESTRUCTIVE") {
+          classification = "DATA_MUTATION_RISK";
+          canAutoDeploy = false;
+        }
+        stmtMatched = true;
+        break;
+      }
+    }
+    if (stmtMatched) continue;
+
+    // 3. Check Risky Additive
+    for (const rule of riskyAdditiveRules) {
+      if (rule.pattern.test(stmt)) {
+        issues.push(rule.message);
+        if (classification !== "DESTRUCTIVE" && classification !== "DATA_MUTATION_RISK") {
+          classification = "RISKY_ADDITIVE";
+          canAutoDeploy = false;
+        }
+        stmtMatched = true;
+        break;
+      }
+    }
+    if (stmtMatched) continue;
+
+    // 4. Check Safe Additive Whitelist
+    for (const pattern of safePatterns) {
+      if (pattern.test(stmt)) {
+        stmtMatched = true;
+        break;
+      }
+    }
+    if (stmtMatched) continue;
+
+    // 5. Fail-Closed: Unrecognized / complex SQL
+    issues.push(`Unrecognized or unclassified SQL statement detected: "${stmt.slice(0, 60)}...". Defaulting to fail-closed review required.`);
+    if (classification !== "DESTRUCTIVE") {
+      classification = "REVIEW_REQUIRED";
+      canAutoDeploy = false;
     }
   }
 
@@ -274,7 +358,8 @@ export function inspectMigrationDirectory(dirPath) {
       classification: "NO_MIGRATIONS",
       canAutoDeploy: true,
       requiresGovernedApproval: false,
-      issues: []
+      issues: [],
+      filesDigest: ""
     };
   }
 
@@ -287,6 +372,7 @@ export function inspectMigrationDirectory(dirPath) {
     const entries = fs.readdirSync(dirPath);
     sqlFiles = entries
       .filter((e) => e.endsWith(".sql"))
+      .sort()
       .map((e) => path.join(dirPath, e));
   }
 
@@ -297,7 +383,8 @@ export function inspectMigrationDirectory(dirPath) {
       classification: "NO_MIGRATIONS",
       canAutoDeploy: true,
       requiresGovernedApproval: false,
-      issues: []
+      issues: [],
+      filesDigest: ""
     };
   }
 
@@ -305,18 +392,25 @@ export function inspectMigrationDirectory(dirPath) {
   let aggregateCanAutoDeploy = true;
   let aggregateRequiresGoverned = false;
   const allIssues = [];
+  const hasher = crypto.createHash("sha256");
 
   for (const file of sqlFiles) {
     const content = fs.readFileSync(file, "utf8");
+    hasher.update(path.basename(file) + ":" + content);
     const analysis = analyzeMigrationSql(content);
-    if (analysis.classification === "DESTRUCTIVE") {
-      aggregateClassification = "DESTRUCTIVE";
+
+    const severityOrder = ["SAFE_ADDITIVE", "RISKY_ADDITIVE", "REVIEW_REQUIRED", "DATA_MUTATION_RISK", "DESTRUCTIVE"];
+    if (severityOrder.indexOf(analysis.classification) > severityOrder.indexOf(aggregateClassification)) {
+      aggregateClassification = analysis.classification;
+    }
+
+    if (analysis.requiresGovernedApproval) {
       aggregateRequiresGoverned = true;
-      aggregateCanAutoDeploy = false;
-    } else if (analysis.classification === "RISKY_ADDITIVE" && aggregateClassification !== "DESTRUCTIVE") {
-      aggregateClassification = "RISKY_ADDITIVE";
+    }
+    if (!analysis.canAutoDeploy) {
       aggregateCanAutoDeploy = false;
     }
+
     for (const issue of analysis.issues) {
       allIssues.push(`${path.basename(file)}: ${issue}`);
     }
@@ -328,18 +422,22 @@ export function inspectMigrationDirectory(dirPath) {
     classification: aggregateClassification,
     canAutoDeploy: aggregateCanAutoDeploy,
     requiresGovernedApproval: aggregateRequiresGoverned,
-    issues: allIssues
+    issues: allIssues,
+    filesDigest: hasher.digest("hex")
   };
 }
 
 /**
- * Rule 5: Cryptographic Scorecard Fingerprint
- * Generates an immutable SHA-256 token of the release scorecard
+ * Rule 5: Cryptographic Integrity Digest
+ * Binds git commit SHA, migration file contents, target directory, and gate results
+ * into an immutable SHA-256 fingerprint certifying verification integrity.
  */
-export function generateApprovalToken(scorecard) {
+export function generateIntegrityDigest(scorecard, migrationDigest = "", gitCommitSha = "") {
   const normalized = JSON.stringify({
     targetDir: scorecard.targetDir,
     timestamp: scorecard.timestamp,
+    gitCommitSha,
+    migrationDigest,
     stages: scorecard.stages
   });
   return crypto.createHash("sha256").update(normalized).digest("hex");
@@ -356,17 +454,20 @@ Usage:
   node safe-deploy.mjs [options]
 
 Options:
-  --dir <path>             Target repository root (default: current working directory)
-  --version <tag>          Release version tag (e.g. v1.2.0)
-  --require-prior-art      Enforce mandatory RESEARCH-BRIEF.md existence and verification
-  --sql <file-or-dir>      Inspect SQL migration file or directory against Risk Matrix (Rule 2)
-  --backup <file>          Verify backup artifact size, format, and headers (Rule 1)
-  --skip-visual            Skip visual sensory audit (for backend-only or non-UI repos)
-  --html <file>            Specific HTML file for visual audit (default: auto-detect)
-  --url <address>          Live URL target for visual sensory audit
-  --update-changelog       Prepend new release section to CHANGELOG.md in repo root
-  --json                   Output summary scorecard as JSON
-  --help, -h              Display documentation
+  --dir <path>                   Target repository root (default: current working directory)
+  --version <tag>                Release version tag (e.g. v1.2.0)
+  --require-prior-art            Enforce mandatory RESEARCH-BRIEF.md existence and verification
+  --sql <file-or-dir>            Inspect SQL migration file or directory against Fail-Closed Risk Matrix
+  --backup <file>                Verify backup artifact existence and gzip/SQL archive integrity
+  --allow-risky-migrations       Explicitly acknowledge and permit Tier 2 risky additive migrations
+  --approve-risk <justification> Explicitly record operator approval note for risky migrations
+  --no-backup-required           Explicitly waive mandatory backup requirement for stateless deployments
+  --skip-visual                  Skip visual sensory audit (for backend-only or non-UI repos)
+  --html <file>                  Specific HTML file for visual audit (default: auto-detect)
+  --url <address>                Live URL target for visual sensory audit
+  --update-changelog             Prepend new release section to CHANGELOG.md in repo root
+  --json                         Output summary scorecard as JSON
+  --help, -h                    Display documentation
 `);
 }
 
@@ -377,6 +478,9 @@ export function parseArgs(args) {
     requirePriorArt: false,
     sql: "",
     backup: "",
+    allowRiskyMigrations: false,
+    approveRisk: "",
+    noBackupRequired: false,
     skipVisual: false,
     html: "",
     url: "",
@@ -399,6 +503,13 @@ export function parseArgs(args) {
       options.sql = path.resolve(process.cwd(), args[++i]);
     } else if (arg === "--backup" && i + 1 < args.length) {
       options.backup = path.resolve(process.cwd(), args[++i]);
+    } else if (arg === "--allow-risky-migrations") {
+      options.allowRiskyMigrations = true;
+    } else if (arg === "--approve-risk" && i + 1 < args.length) {
+      options.approveRisk = args[++i];
+      options.allowRiskyMigrations = true;
+    } else if (arg === "--no-backup-required") {
+      options.noBackupRequired = true;
     } else if (arg === "--skip-visual") {
       options.skipVisual = true;
     } else if (arg === "--html" && i + 1 < args.length) {
@@ -421,7 +532,7 @@ export function runPipeline(options) {
     targetDir,
     timestamp: new Date().toISOString(),
     overallSuccess: false,
-    approvalToken: "",
+    integrityDigest: "",
     stages: {
       priorArt: { name: "Prior-Art Research (Stage 0)", status: "SKIPPED", details: "" },
       invariants: { name: "System Invariants (Gate 1)", status: "PENDING", details: "" },
@@ -499,11 +610,18 @@ export function runPipeline(options) {
       }
       return { success: false, scorecard };
     }
-  }
-  scorecard.stages.invariants.status = "PASSED";
-  scorecard.stages.invariants.details = "All character, legibility, and brand invariants satisfied.";
-  if (!options.json) {
-    console.log("[Gate 1: System Invariants] PASSED (Zero em dashes, formatting, file bounds verified).");
+    // Honest status reporting: FALLBACK_PASSED instead of full PASSED
+    scorecard.stages.invariants.status = "FALLBACK_PASSED";
+    scorecard.stages.invariants.details = "Fallback scanner verified character invariants (zero em dashes). Full AST formatting engine not present.";
+    if (!options.json) {
+      console.log("[Gate 1: System Invariants] FALLBACK_PASSED (Character invariants verified).");
+    }
+  } else {
+    scorecard.stages.invariants.status = "PASSED";
+    scorecard.stages.invariants.details = "All character, legibility, and brand invariants satisfied.";
+    if (!options.json) {
+      console.log("[Gate 1: System Invariants] PASSED (Zero em dashes, formatting, file bounds verified).");
+    }
   }
 
   // Gate 2: Visual Sensory Audit Gate
@@ -570,9 +688,24 @@ export function runPipeline(options) {
     }
   }
 
-  if (sqlTarget || options.backup) {
+  let migrationReport = { hasMigrations: false, filesDigest: "" };
+  if (sqlTarget) {
+    migrationReport = inspectMigrationDirectory(sqlTarget);
+  }
+
+  if (migrationReport.hasMigrations || options.backup) {
     if (!options.json) {
       console.log("\n[Data Safety Gate] Inspecting migrations and backup verification...");
+    }
+
+    // Rule 1 Enforcement: If migrations exist, a backup is mandatory unless explicitly waived
+    if (migrationReport.hasMigrations && !options.backup && !options.noBackupRequired) {
+      scorecard.stages.migrations.status = "FAILED";
+      scorecard.stages.migrations.details = "SQL migrations detected but no --backup artifact was provided. Rule 1 mandates backup verification. Pass --backup <path> or explicitly pass --no-backup-required.";
+      if (!options.json) {
+        console.error("[Data Safety Gate] FAILED: Missing mandatory backup artifact for migrations.");
+      }
+      return { success: false, scorecard };
     }
 
     // Verify backup if provided
@@ -589,35 +722,46 @@ export function runPipeline(options) {
     }
 
     // Inspect migrations if found
-    if (sqlTarget) {
-      const migrationReport = inspectMigrationDirectory(sqlTarget);
-      if (migrationReport.hasMigrations) {
-        if (migrationReport.classification === "DESTRUCTIVE") {
-          scorecard.stages.migrations.status = "GOVERNED_APPROVAL_REQUIRED";
-          scorecard.stages.migrations.details = `Destructive SQL detected (${migrationReport.issues.length} flags). Requires restore-rehearsed backup and human sign-off.`;
+    if (migrationReport.hasMigrations) {
+      if (migrationReport.classification === "DESTRUCTIVE") {
+        scorecard.stages.migrations.status = "GOVERNED_APPROVAL_REQUIRED";
+        scorecard.stages.migrations.details = `Destructive SQL detected (${migrationReport.issues.length} flags). Standard path BLOCKED. Requires restore-rehearsed backup and human execution.`;
+        if (!options.json) {
+          console.error("[Data Safety Gate] DESTRUCTIVE MIGRATION BLOCKED on standard path:");
+          for (const issue of migrationReport.issues) {
+            console.error(`  - ${issue}`);
+          }
+        }
+        return { success: false, scorecard };
+      } else if (
+        migrationReport.classification === "RISKY_ADDITIVE" ||
+        migrationReport.classification === "DATA_MUTATION_RISK" ||
+        migrationReport.classification === "REVIEW_REQUIRED"
+      ) {
+        // Enforce risk-review outcome: FAIL by default unless explicitly approved
+        if (!options.allowRiskyMigrations) {
+          scorecard.stages.migrations.status = "BLOCKED_ON_RISK_REVIEW";
+          scorecard.stages.migrations.details = `Operationally risky or unclassified SQL detected (${migrationReport.issues.length} flags). Autonomous rollout BLOCKED. Pass --allow-risky-migrations or --approve-risk "<note>" after locking analysis.`;
           if (!options.json) {
-            console.error(`[Data Safety Gate] DESTRUCTIVE MIGRATION BLOCKED on standard path:`);
+            console.error(`[Data Safety Gate] BLOCKED ON RISK REVIEW (${migrationReport.classification}):`);
             for (const issue of migrationReport.issues) {
               console.error(`  - ${issue}`);
             }
+            console.error("\nTo proceed after locking analysis, rerun with --allow-risky-migrations or --approve-risk \"<justification>\".");
           }
           return { success: false, scorecard };
-        } else if (migrationReport.classification === "RISKY_ADDITIVE") {
-          scorecard.stages.migrations.status = "LOCKING_REVIEW_REQUIRED";
-          scorecard.stages.migrations.details = `Additive but operationally risky SQL detected (${migrationReport.issues.length} flags). Requires locking analysis.`;
-          if (!options.json) {
-            console.warn(`[Data Safety Gate] WARNING: Operationally risky additive SQL detected:`);
-            for (const issue of migrationReport.issues) {
-              console.warn(`  - ${issue}`);
-            }
-          }
-          // Do not fail hard, but record status
         } else {
-          scorecard.stages.migrations.status = "PASSED";
-          scorecard.stages.migrations.details = `Safe additive migrations verified (${migrationReport.filesCount} files).`;
+          scorecard.stages.migrations.status = "PASSED_WITH_RISK_OVERRIDE";
+          scorecard.stages.migrations.details = `Risk review acknowledged by operator: ${options.approveRisk || "explicit override flag"}.`;
           if (!options.json) {
-            console.log(`[Data Safety Gate] PASSED: Safe additive migrations verified (${migrationReport.filesCount} files).`);
+            console.warn(`[Data Safety Gate] PASSED WITH RISK OVERRIDE (${options.approveRisk || "explicit flag"}).`);
           }
+        }
+      } else {
+        scorecard.stages.migrations.status = "PASSED";
+        scorecard.stages.migrations.details = `Safe additive migrations verified (${migrationReport.filesCount} files).`;
+        if (!options.json) {
+          console.log(`[Data Safety Gate] PASSED: Safe additive migrations verified (${migrationReport.filesCount} files).`);
         }
       }
     }
@@ -636,11 +780,11 @@ export function runPipeline(options) {
   }
   const broadcastRun = runTool(TOOLS.broadcast, broadcastArgs, targetDir);
   if (!broadcastRun.success) {
-    // Fallback: stage basic release manifest if external tool is absent
-    scorecard.stages.broadcast.status = "PASSED";
-    scorecard.stages.broadcast.details = "Release manifest generated in standalone mode.";
+    // Honest status reporting: STANDALONE_STAGED
+    scorecard.stages.broadcast.status = "STANDALONE_STAGED";
+    scorecard.stages.broadcast.details = "Basic release manifest generated in standalone mode. Broadcast engine not present.";
     if (!options.json) {
-      console.log("[Gate 4: Release Packaging] PASSED (Standalone manifest staged).");
+      console.log("[Gate 4: Release Packaging] STANDALONE_STAGED (Basic manifest staged).");
     }
   } else {
     scorecard.stages.broadcast.status = "PASSED";
@@ -650,9 +794,18 @@ export function runPipeline(options) {
     }
   }
 
-  // Gate 5: Rule 5 Human Barrier & Cryptographic Fingerprint
+  // Gate 5: Rule 5 Human Barrier & Cryptographic Integrity Digest
   scorecard.overallSuccess = true;
-  scorecard.approvalToken = generateApprovalToken(scorecard);
+
+  // Retrieve git commit SHA if repository is git-backed
+  let gitCommitSha = "";
+  try {
+    gitCommitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: targetDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    gitCommitSha = "uncommitted-working-copy";
+  }
+
+  scorecard.integrityDigest = generateIntegrityDigest(scorecard, migrationReport.filesDigest, gitCommitSha);
 
   if (options.json) {
     console.log(JSON.stringify(scorecard, null, 2));
@@ -667,12 +820,12 @@ export function runPipeline(options) {
     console.log(` Gate 4  : Release & Broadcast Pack : ${scorecard.stages.broadcast.status}`);
     console.log(` Gate 5  : Human Sign-Off Boundary : ${scorecard.stages.humanGate.status}`);
     console.log("===========================================================");
-    console.log(` Cryptographic Approval Token : sha256:${scorecard.approvalToken.slice(0, 16)}...`);
+    console.log(` Cryptographic Integrity Digest    : sha256:${scorecard.integrityDigest.slice(0, 16)}...`);
     console.log("===========================================================");
-    console.log("\nRULE 5 TECHNICAL BOUNDARY ENFORCED:");
-    console.log("All automated gates and checks are green. Artifacts staged locally.");
-    console.log("The AI coding agent possesses no production execution credentials.");
-    console.log("Production migration application, deploy trigger, and broadcast require human authorization.");
+    console.log("\nINTEGRITY & AUTHORIZATION BOUNDARY ENFORCED:");
+    console.log("1. Integrity Digest certifies that local verification gates and migration files match.");
+    console.log("2. The AI coding agent possesses ZERO production credentials or write keys.");
+    console.log("3. Authorization must be executed via infrastructure controls (e.g. GitHub Environment Protection).");
   }
 
   return { success: true, scorecard };
