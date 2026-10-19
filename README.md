@@ -1,29 +1,43 @@
-# Safe Deploy: The Production Release Protocol
+# Safe Deploy: Unified Studio Delivery Pipeline (wb4g-pipeline)
 
-> **An open-source AI engineering protocol from [We Build for Good](https://webuildforgood.com)**  
-> *Let AI do the preparation. Keep releases boring.*
+> **An open-source AI engineering protocol and delivery engine from [We Build for Good](https://webuildforgood.com)**  
+> *Let AI do the preparation and multi-gate verification. Keep human hands on the irreversible buttons.*
 
 ---
 
 ## Overview
 
-`safe-deploy` is an operational protocol for AI coding assistants (Claude Code, Cursor, Antigravity, OpenAI Codex). 
+`safe-deploy` (`wb4g-pipeline`) is the unified delivery and release verification pipeline for software engineers, product leads, and autonomous AI agents (Antigravity, Claude Code, Cursor, Codex).
 
-It governs how an AI agent prepares, verifies, and executes software releases to production environments.
-
-The protocol is designed around a single principle: **AI agents prepare and verify everything; human operators press the irreversible buttons.**
+It chains the four deterministic verification gates of our autonomous studio into a single execution pass:
+1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Verifies evidence-backed research and build decisions before shipping.
+2. **Gate 1: System Invariants Engine (`wb4g-invariants`)**: Enforces character invariants (zero em dashes), Prettier legibility, brand boundaries, and file bounds.
+3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Drives headless Chrome across 375px, 768px, and 1440px viewports to detect layout blowouts, broken media, touch collisions, and console errors.
+4. **Gate 3: Release & Broadcast Packaging (`wb4g-broadcast`)**: Compiles git commits into manifests, changelogs, and staged customer announcement drafts.
+5. **Gate 4: Human Sign-Off Barrier (Rule 5)**: Mechanically holds irreversible production deployments and broadcast transmissions until human approval is given.
 
 ---
 
-## Why This Exists
+## CLI Usage
 
-Letting an autonomous coding agent touch a live production application is one of the highest-risk moments in modern software development. Without strict procedural guardrails, agents can:
-* Trigger migrations that drop production columns or lock critical tables.
-* Ship frontend code before backend APIs have been updated.
-* Trust piped command outputs that mask failure exit codes.
-* Deploy unverified code without a restorable database backup.
+Install locally or run via node:
 
-`safe-deploy` turns a stressful release into a predictable, five-step verified sequence where nothing can go wrong that you cannot immediately undo.
+```bash
+# Run the full unified delivery pipeline against the current repository
+node bin/safe-deploy.mjs
+
+# Run pipeline with explicit version tag and changelog update
+node bin/safe-deploy.mjs --version v1.2.0 --update-changelog
+
+# Run pipeline enforcing prior-art brief existence
+node bin/safe-deploy.mjs --require-prior-art
+
+# Run pipeline for a backend repository (skipping visual browser audit)
+node bin/safe-deploy.mjs --skip-visual
+
+# Output structured scorecard JSON for CI/CD integration
+node bin/safe-deploy.mjs --json
+```
 
 ---
 
@@ -39,35 +53,32 @@ Letting an autonomous coding agent touch a live production application is one of
 
 ## Installation
 
+### As CLI Tool
+```bash
+git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git
+cd skill-safe-deploy
+npm test
+npm link
+```
+
+### For Antigravity / Gemini
+```bash
+mkdir -p ~/.gemini/config/skills/safe-deploy
+cp -r . ~/.gemini/config/skills/safe-deploy/
+```
+
 ### For Claude Code
-Clone or copy this folder into your skills directory:
 ```bash
 git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git ~/.claude/skills/safe-deploy
 ```
 
-### For Cursor
-Add this skill to your workspace skills directory:
-```bash
-mkdir -p .cursor/skills
-git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git .cursor/skills/safe-deploy
-```
-
-### For Antigravity / Open Agent Skills
-```bash
-mkdir -p .agents/skills
-git clone https://github.com/We-Build-For-Good/skill-safe-deploy.git .agents/skills/safe-deploy
-```
-
 ---
 
-## Usage
+## Automated Test Suite
 
-Once installed, invoke the skill whenever you are preparing a release:
-* *"Prepare a safe deploy for the main branch."*
-* *"Ship this release to production."*
-* *"We have database migrations to run: follow safe-deploy."*
-
-The AI assistant will immediately establish ground truth, classify migrations, draft backup commands, and guide you through the verified release gates.
+```bash
+node --test test/*.test.mjs
+```
 
 ---
 

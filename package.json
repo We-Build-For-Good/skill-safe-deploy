@@ -1,0 +1,25 @@
+{
+  "name": "@webuildforgood/skill-safe-deploy",
+  "version": "1.1.0",
+  "description": "Deterministic studio delivery pipeline chaining prior-art verification, invariant checks, visual sensory audits, and staged release packaging with human approval boundaries.",
+  "main": "bin/safe-deploy.mjs",
+  "bin": {
+    "wb4g-pipeline": "bin/safe-deploy.mjs",
+    "wb4g-safe-deploy": "bin/safe-deploy.mjs"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "pipeline": "node bin/safe-deploy.mjs"
+  },
+  "keywords": [
+    "safe-deploy",
+    "delivery-pipeline",
+    "verification-gate",
+    "production-release",
+    "agentic-ai",
+    "antigravity"
+  ],
+  "author": "We Build for Good",
+  "license": "MIT"
+}

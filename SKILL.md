@@ -1,17 +1,17 @@
 ---
 name: safe-deploy
-description: Safely ship accumulated changes to a live product: the Production Release Protocol. Take a verified backup, block irreversible data loss, deploy in staged verified steps, trust system exit codes over agent assertions, and keep the human on the irreversible buttons. Use whenever deploying to production, running database migrations, releasing AI-built code, or when nervous about a live update.
+description: Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, and release packaging into an automated scorecard, holding irreversible actions for human approval.
 license: MIT
 metadata:
   author: We Build for Good
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
-# Safe Deploy: The Production Release Protocol
+# Safe Deploy: The Production Release Protocol & Unified Pipeline (wb4g-pipeline)
 
 Shipping a large pile of changes to a live product is only scary when there is no system. 
 
-This is the system: five rules, in order, that make a major release predictable because nothing can go wrong that you cannot undo. 
+This is the system: five rules and an automated four-gate delivery pipeline that make a major release predictable because nothing can go wrong that you cannot undo. 
 
 It was extracted from a real production release where a live application sat frozen for a month with tens of thousands of lines of finished work and 11 database migrations stacked behind it. It was shipped in a single session with zero downtime, zero broken features, and a backup that was never needed.
 
@@ -27,22 +27,24 @@ The AI assistant drafts the exact command, verifies prerequisites, watches the r
 
 ---
 
-## Phase 0: Establish Ground Truth (Verify, Never Assume)
+## The Four Automated Gates of wb4g-pipeline
 
-State these in one line each before touching anything:
+When preparing any release, execute the automated verification pipeline:
 
-1. **What is live vs what you are shipping**:
-   Measure the exact delta between the deployed production commit and your target branch (number of commits, lines changed, file count). Use real git measurements, never estimates.
-2. **Does it touch a production database?**:
-   List every new migration file. Open each SQL file and classify it (Additive vs Destructive). This determines whether the release follows the ordinary path or the governed safety path.
-3. **How this project deploys**:
-   Does the host auto-deploy on git push? Does the backend deploy separately from the frontend? Do migrations run at container startup or as a manual step? Know the exact mechanics for this specific repository before ordering the release sequence.
+```bash
+node bin/safe-deploy.mjs --dir /path/to/repo --version v1.2.0
+```
 
-If you cannot answer these three questions with measured facts, stop and investigate. A deploy planned on assumptions is how a frontend ends up live against a backend that lacks its endpoints.
+The runner chains:
+1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Validates `RESEARCH-BRIEF.md` to ensure prior art was investigated before custom code was built.
+2. **Gate 1: System Invariants (`wb4g-invariants`)**: Mechanical verification of character invariants (zero em dashes), Prettier legibility, file bounds, and brand boundaries.
+3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Headless Chrome verification across 375px, 768px, and 1440px viewports (catching layout blowouts, broken assets, and runtime errors).
+4. **Gate 3: Release Packaging (`wb4g-broadcast`)**: Compiles landed git commits into release manifests, categorized changelogs, and staged broadcast copy.
+5. **Gate 4: Human Sign-off Barrier**: Freezes irreversible actions until human sign-off.
 
 ---
 
-## The Five Rules (In Strict Order)
+## The Five Safety Rules (In Strict Order)
 
 ### Rule 1: Take a Photo First (The Human Gate)
 
