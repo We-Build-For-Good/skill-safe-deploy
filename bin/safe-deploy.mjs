@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -868,17 +869,20 @@ export function runPipeline(rawOptions) {
     scorecard.stages.visualAudit.details = options.skipVisual ? "Skipped with --skip-visual." : "No HTML entry point found and no --url given.";
     log(`[${scorecard.stages.visualAudit.name}] SKIPPED (${scorecard.stages.visualAudit.details})`);
   } else {
-    const auditArgs = ["--dir", targetDir];
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "wb4g-visual-audit-"));
+    const auditArgs = options.url ? [options.url] : ["--dir", targetDir];
     if (options.html) auditArgs.push("--file", options.html);
-    if (options.url) auditArgs.push(options.url);
+    auditArgs.push("--output-dir", outputDir);
     const visualRun = runTool(TOOLS.visualAudit, auditArgs, targetDir);
     if (!visualRun.available) {
       notRun("visualAudit", "visual audit tool not installed (skill-visual-sensory-audit)");
+    } else if (visualRun.exitCode === 3) {
+      notRun("visualAudit", `visual audit could not run on this machine: ${(visualRun.error || "").trim().slice(0, 200)}`);
     } else if (!visualRun.success) {
       return fail("visualAudit", "FAILED", (visualRun.output || visualRun.error).trim().slice(0, 2000));
     } else {
       scorecard.stages.visualAudit.status = "PASSED";
-      scorecard.stages.visualAudit.details = "Visual audit tool passed.";
+      scorecard.stages.visualAudit.details = `Visual audit tool passed. Screenshots: ${outputDir}`;
       log(`[${scorecard.stages.visualAudit.name}] PASSED`);
     }
   }
