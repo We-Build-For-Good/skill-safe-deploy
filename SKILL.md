@@ -11,7 +11,7 @@ metadata:
 
 Shipping a big pile of changes to a live product is only scary when there is no system.
 
-This is the system: five rules, in order, plus a checker that runs the parts a machine can check. It was extracted from a real release: a live product that had not been deployed for a month, with about 125 commits, 65,000 lines of finished work, and 11 database migrations behind it. It shipped in a single session, and the backup was never needed.
+This is the system: five rules, in order, plus a checker that runs the parts a machine can check. It was extracted from a real release: a live product that had not been deployed for a month, with more than 100 commits, about 64,000 added lines, and 11 database migrations behind it. It shipped in a single session, and the backup was never needed.
 
 ---
 
