@@ -1010,8 +1010,16 @@ export function runPipeline(rawOptions) {
   }
 
   // Gate 4: Release packaging
-  const broadcastArgs = ["--dir", targetDir];
+  const gatesFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "wb4g-gates-")), "gates.json");
+  const gateResults = Object.fromEntries(
+    ["priorArt", "invariants", "visualAudit", "migrations"]
+      .filter((k) => scorecard.stages[k].status !== "SKIPPED")
+      .map((k) => [k, { status: scorecard.stages[k].status.startsWith("PASSED") ? "PASSED" : scorecard.stages[k].status }])
+  );
+  fs.writeFileSync(gatesFile, JSON.stringify(gateResults));
+  const broadcastArgs = ["--dir", targetDir, "--gates", gatesFile, "--allow-empty"];
   if (options.version) broadcastArgs.push("--version", options.version);
+  if (options.since) broadcastArgs.push("--since", options.since);
   if (options.updateChangelog) broadcastArgs.push("--update-changelog");
   const git = gitState(targetDir);
   const broadcastRun = git.sha === "not-a-git-repository"
