@@ -512,7 +512,7 @@ test("Backup: truncated dumps, unknown formats, and stale backups are rejected",
 });
 
 test("Em dashes in a user's repo do not fail the deploy unless they run the invariant engine", () => {
-  const dir = fixture({ "README.md": "Hello — world" });
+  const dir = fixture({ "README.md": `Hello ${String.fromCharCode(0x2014)} world` });
   try {
     const r = run(dir);
     // If the invariant engine is co-located it may enforce its own rules; standalone, the gate is NOT_RUN.
