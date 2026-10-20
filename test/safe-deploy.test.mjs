@@ -12,9 +12,9 @@ import {
   splitSqlStatements,
   analyzeMigrationSql,
   inspectMigrationDirectory,
-  checkInvariantsFallback,
   generateIntegrityDigest
 } from "../bin/safe-deploy.mjs";
+import { execFileSync } from "node:child_process";
 
 test("parseArgs parses all pipeline, safety, and isolated override options properly", () => {
   const args = [
@@ -105,7 +105,7 @@ test("Rule 1: Backup verification catches missing, empty, corrupt header, and tr
 
     // 6. Valid gzip archive (fully decompresses cleanly)
     const validGz = path.join(tmpDir, "valid.sql.gz");
-    const rawSql = Buffer.from("-- PostgreSQL Dump\nCREATE TABLE users (id serial primary key);\n" + "x".repeat(1500));
+    const rawSql = Buffer.from("-- PostgreSQL database dump\nCREATE TABLE users (id serial primary key);\n" + "-- x\n".repeat(400) + "--\n-- PostgreSQL database dump complete\n--\n");
     const gzipped = zlib.gzipSync(rawSql);
     fs.writeFileSync(validGz, gzipped);
     const gzPass = verifyBackup(validGz, { minBytes: 50 });
@@ -130,11 +130,10 @@ test("Rule 2: Fail-closed SQL classifier isolates data mutation from unclassifie
   assert.equal(updateResult.classification, "DATA_MUTATION_RISK");
   assert.equal(updateResult.canAutoDeploy, false);
 
-  // Unrecognized SQL (MERGE INTO) defaults to REVIEW_REQUIRED
-  const mergeSql = "MERGE INTO target USING source ON target.id = source.id WHEN MATCHED THEN UPDATE SET val = source.val;";
-  const mergeResult = analyzeMigrationSql(mergeSql);
-  assert.equal(mergeResult.classification, "REVIEW_REQUIRED");
-  assert.equal(mergeResult.canAutoDeploy, false);
+  // Unrecognized SQL (GRANT) defaults to REVIEW_REQUIRED
+  const grantResult = analyzeMigrationSql("GRANT ALL ON profiles TO anon;");
+  assert.equal(grantResult.classification, "REVIEW_REQUIRED");
+  assert.equal(grantResult.canAutoDeploy, false);
 });
 
 test("Decisive Demonstration: Complete CLI run against destructive fixture exits non-zero and CANNOT be overridden by ordinary risk flags", () => {
@@ -168,8 +167,14 @@ test("Decisive Demonstration: Complete CLI run against destructive fixture exits
     const exitCodeBypass2 = executeCli(["--dir", tmpDir, "--sql", migDir, "--approve-risk", "Attempted bypass", "--no-backup-required", "--skip-visual"]);
     assert.equal(exitCodeBypass2, 1);
 
-    // 5. Explicit governed execution flag (--allow-destructive): Cleared on governed path
-    const exitCodeGoverned = executeCli(["--dir", tmpDir, "--sql", migDir, "--allow-destructive", "--no-backup-required", "--skip-visual"]);
+    // 5. --allow-destructive without a verified backup: MUST STILL FAIL (regression: v1.4.0 passed this)
+    const exitCodeNoBackup = executeCli(["--dir", tmpDir, "--sql", migDir, "--allow-destructive", "--no-backup-required", "--skip-visual"]);
+    assert.equal(exitCodeNoBackup, 1);
+
+    // 6. Governed path: verified backup + restore rehearsal note
+    const backup = path.join(tmpDir, "prod.sql");
+    fs.writeFileSync(backup, "-- PostgreSQL database dump\n" + "-- x\n".repeat(400) + "-- PostgreSQL database dump complete\n");
+    const exitCodeGoverned = executeCli(["--dir", tmpDir, "--sql", migDir, "--allow-destructive", "--backup", backup, "--restore-rehearsed", "Restored into scratch DB, row counts match", "--skip-visual"]);
     assert.equal(exitCodeGoverned, 0);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -205,7 +210,7 @@ test("Isolation: Unclassified SQL cannot be bypassed by --allow-risky-migrations
       json: true
     });
     assert.equal(resExplicit.success, true);
-    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_UNCLASSIFIED_APPROVAL");
+    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_APPROVALS");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -240,7 +245,7 @@ test("Isolation: Data mutation SQL cannot be bypassed by --allow-risky-migration
       json: true
     });
     assert.equal(resExplicit.success, true);
-    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_MUTATION_APPROVAL");
+    assert.equal(resExplicit.scorecard.stages.migrations.status, "PASSED_WITH_APPROVALS");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -297,7 +302,7 @@ test("Pipeline Enforcement: Risky additive migration BLOCKS unless explicitly ov
       json: true
     });
     assert.equal(passed.success, true);
-    assert.equal(passed.scorecard.stages.migrations.status, "PASSED_WITH_RISK_OVERRIDE");
+    assert.equal(passed.scorecard.stages.migrations.status, "PASSED_WITH_APPROVALS");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -309,16 +314,18 @@ test("Rule 5: Cryptographic Integrity Digest binds migration content and commit"
     timestamp: "2026-10-19T12:00:00.000Z",
     stages: { invariants: { status: "PASSED" } }
   };
-  const digest1 = generateIntegrityDigest(mockScorecard, "hashA", "commit123");
-  const digest2 = generateIntegrityDigest(mockScorecard, "hashA", "commit123");
-  const digest3 = generateIntegrityDigest(mockScorecard, "hashB", "commit123");
+  const digest1 = generateIntegrityDigest(mockScorecard, "hashA", "commit123", "clean");
+  const digest2 = generateIntegrityDigest({ ...mockScorecard, timestamp: "2026-10-20T09:00:00.000Z" }, "hashA", "commit123", "clean");
+  const digest3 = generateIntegrityDigest(mockScorecard, "hashB", "commit123", "clean");
+  const digest4 = generateIntegrityDigest(mockScorecard, "hashA", "commit123", "dirty-tree-hash");
 
-  assert.equal(digest1, digest2);
+  assert.equal(digest1, digest2, "fingerprint must not depend on the run time, so CI can reproduce it");
   assert.notEqual(digest1, digest3);
+  assert.notEqual(digest1, digest4, "uncommitted changes must change the fingerprint");
   assert.equal(digest1.length, 64);
 });
 
-test("Fallback transparency: Standalone clean clone reports FALLBACK_PASSED honestly", () => {
+test("Honest status: tools that are not installed report NOT_RUN, never PASSED", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clean-clone-"));
   try {
     fs.writeFileSync(path.join(tmpDir, "README.md"), "# Clean App\nClean hyphens.\n");
@@ -329,8 +336,11 @@ test("Fallback transparency: Standalone clean clone reports FALLBACK_PASSED hone
     });
 
     assert.equal(result.success, true);
-    assert.ok(["PASSED", "FALLBACK_PASSED"].includes(result.scorecard.stages.invariants.status));
-    assert.equal(result.scorecard.stages.broadcast.status, "STANDALONE_STAGED");
+    assert.ok(["PASSED", "NOT_RUN"].includes(result.scorecard.stages.invariants.status));
+    assert.ok(["PASSED", "NOT_RUN"].includes(result.scorecard.stages.broadcast.status));
+    if (result.scorecard.stages.broadcast.status === "NOT_RUN") {
+      assert.equal(result.scorecard.result, "PASSED_WITH_GAPS");
+    }
     assert.ok(result.scorecard.integrityDigest.length > 0);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -340,4 +350,207 @@ test("Fallback transparency: Standalone clean clone reports FALLBACK_PASSED hone
 test("executeCli --help exits with 0", () => {
   const exitCode = executeCli(["--help"]);
   assert.equal(exitCode, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 2026-10-20 catalogue review. Each one failed on v1.4.0.
+// ---------------------------------------------------------------------------
+
+function fixture(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sd-regression-"));
+  for (const [rel, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  }
+  return dir;
+}
+
+function quiet(fn) {
+  const log = console.log;
+  const err = console.error;
+  let out = "";
+  console.log = (...a) => { out += a.join(" ") + "\n"; };
+  console.error = () => {};
+  try {
+    return { value: fn(), out };
+  } finally {
+    console.log = log;
+    console.error = err;
+  }
+}
+
+const base = { noBackupRequired: true, skipVisual: true, json: true };
+const run = (dir, extra = {}) => quiet(() => runPipeline({ dir, ...base, ...extra })).value;
+
+test("Isolation: unclassified SQL followed by CREATE INDEX is not approved by --allow-risky-migrations", () => {
+  const dir = fixture({ "migrations/001.sql": "GRANT ALL ON t TO anon; CREATE INDEX i ON t(x);" });
+  try {
+    const r = run(dir, { allowRiskyMigrations: true });
+    assert.equal(r.success, false);
+    assert.equal(r.scorecard.stages.migrations.status, "BLOCKED_ON_UNCLASSIFIED_SQL");
+    assert.deepEqual(analyzeMigrationSql("GRANT ALL ON t TO anon; CREATE INDEX i ON t(x);").categories, ["RISKY_ADDITIVE", "REVIEW_REQUIRED"]);
+    assert.equal(run(dir, { allowRiskyMigrations: true, approveUnclassifiedSql: "grant reviewed" }).success, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Isolation: approving unclassified SQL does not approve an UPDATE in the same file", () => {
+  const dir = fixture({ "migrations/001.sql": "UPDATE t SET a = 1; GRANT ALL ON t TO anon;" });
+  try {
+    const r = run(dir, { approveUnclassifiedSql: "grant reviewed" });
+    assert.equal(r.success, false);
+    assert.equal(r.scorecard.stages.migrations.status, "BLOCKED_ON_DATA_MUTATION");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Isolation: approvals across separate files are also independent", () => {
+  const dir = fixture({ "migrations/001.sql": "UPDATE t SET a = 1;", "migrations/002.sql": "VACUUM FULL t;" });
+  try {
+    assert.equal(run(dir, { approveDataMutation: "batched" }).success, false);
+    assert.equal(run(dir, { approveDataMutation: "batched", approveUnclassifiedSql: "vacuum ok" }).success, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Fail-closed: migrations in subfolders (Prisma layout) are found", () => {
+  const dir = fixture({ "prisma/migrations/20240101_x/migration.sql": "DROP TABLE users;" });
+  try {
+    const r = run(dir);
+    assert.equal(r.success, false);
+    assert.equal(r.scorecard.stages.migrations.status, "GOVERNED_APPROVAL_REQUIRED");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Fail-closed: a --sql path that does not exist fails instead of passing", () => {
+  const dir = fixture({ "README.md": "hi" });
+  try {
+    const r = run(dir, { sql: path.join(dir, "nope") });
+    assert.equal(r.success, false);
+    assert.match(r.scorecard.stages.migrations.details, /does not exist/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--since only checks migrations changed since the ref, so an old DROP does not block forever", () => {
+  const dir = fixture({ "migrations/001_old.sql": "DROP TABLE legacy;" });
+  try {
+    const git = (...a) => execFileSync("git", a, { cwd: dir, stdio: "ignore" });
+    git("init", "-q");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "add", ".");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "old");
+    git("tag", "v1");
+    fs.writeFileSync(path.join(dir, "migrations/002_new.sql"), "CREATE TABLE widgets (id int);");
+
+    assert.equal(run(dir).success, false, "without --since every file is checked (fail-closed default)");
+    const r = run(dir, { since: "v1" });
+    assert.equal(r.success, true);
+    assert.equal(r.scorecard.stages.migrations.status, "PASSED");
+    assert.equal(run(dir, { since: "no-such-ref" }).success, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Classifier: Supabase function bodies do not trigger DESTRUCTIVE, DO blocks do", () => {
+  const fn = "CREATE FUNCTION f() RETURNS void AS $$ BEGIN DELETE FROM sessions WHERE x < now(); END; $$ LANGUAGE plpgsql;";
+  assert.deepEqual(splitSqlStatements(fn).length, 1);
+  assert.equal(analyzeMigrationSql(fn).classification, "REVIEW_REQUIRED");
+  const doBlock = "DO $$ BEGIN DROP TABLE users; END $$;";
+  assert.equal(analyzeMigrationSql(doBlock).classification, "DESTRUCTIVE");
+});
+
+test("Classifier: column additions follow Postgres 11+ rules", () => {
+  const cls = (sql) => analyzeMigrationSql(sql).classification;
+  assert.equal(cls("ALTER TABLE t ADD COLUMN n integer DEFAULT 0;"), "SAFE_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN s text DEFAULT 'x' NOT NULL;"), "SAFE_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN n numeric(10,2);"), "SAFE_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN ts timestamp with time zone;"), "SAFE_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN id uuid DEFAULT gen_random_uuid();"), "RISKY_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN n int NOT NULL;"), "RISKY_ADDITIVE");
+  assert.equal(cls("ALTER TABLE t ADD COLUMN a int, DROP COLUMN b;"), "DESTRUCTIVE");
+  assert.equal(cls("ALTER TABLE IF EXISTS t DROP email;"), "DESTRUCTIVE");
+  assert.equal(cls("ALTER TABLE t ALTER COLUMN c SET DATA TYPE bigint;"), "DESTRUCTIVE");
+  assert.equal(cls("ALTER TABLE t ALTER COLUMN c DROP DEFAULT;"), "SAFE_ADDITIVE");
+  assert.equal(cls("DROP POLICY p ON t;"), "DESTRUCTIVE");
+  assert.equal(cls("INSERT INTO t (a, b) SELECT a, b FROM s;"), "DATA_MUTATION_RISK");
+});
+
+test("Backup: truncated dumps, unknown formats, and stale backups are rejected", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sd-backup-"));
+  try {
+    const trunc = path.join(dir, "trunc.sql");
+    fs.writeFileSync(trunc, "-- PostgreSQL database dump\n" + "INSERT INTO t VALUES (1);\n".repeat(100) + "INSERT INTO t VAL");
+    assert.equal(verifyBackup(trunc).valid, false);
+
+    const junk = path.join(dir, "old.dump");
+    fs.writeFileSync(junk, Buffer.alloc(2000, 7));
+    assert.equal(verifyBackup(junk).valid, false);
+
+    const good = path.join(dir, "good.sql");
+    fs.writeFileSync(good, "-- PostgreSQL database dump\n" + "-- x\n".repeat(400) + "-- PostgreSQL database dump complete\n");
+    assert.equal(verifyBackup(good).valid, true);
+    assert.equal(verifyBackup(good).assurance, "FULL");
+    const twoDaysAgo = new Date(Date.now() - 48 * 3_600_000);
+    fs.utimesSync(good, twoDaysAgo, twoDaysAgo);
+    assert.equal(verifyBackup(good).valid, false);
+    assert.equal(verifyBackup(good, { maxAgeHours: 0 }).valid, true);
+
+    const gzTrunc = path.join(dir, "trunc.sql.gz");
+    const gz = zlib.gzipSync(fs.readFileSync(good));
+    fs.writeFileSync(gzTrunc, gz.subarray(0, gz.length - 20));
+    assert.equal(verifyBackup(gzTrunc, { minBytes: 10 }).valid, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Em dashes in a user's repo do not fail the deploy unless they run the invariant engine", () => {
+  const dir = fixture({ "README.md": "Hello — world" });
+  try {
+    const r = run(dir);
+    // If the invariant engine is co-located it may enforce its own rules; standalone, the gate is NOT_RUN.
+    if (r.scorecard.stages.invariants.status === "NOT_RUN") assert.equal(r.success, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--json prints the scorecard on failure too", () => {
+  const dir = fixture({ "migrations/001.sql": "DROP TABLE users;" });
+  try {
+    const { value, out } = quiet(() => runPipeline({ dir, ...base }));
+    assert.equal(value.success, false);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.failedStage, "migrations");
+    assert.equal(parsed.overallSuccess, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--expect-digest fails when the release differs from what was verified", () => {
+  const dir = fixture({ "migrations/001.sql": "CREATE TABLE a (id int);" });
+  try {
+    const first = run(dir);
+    assert.equal(first.success, true);
+    assert.equal(run(dir, { expectDigest: first.scorecard.integrityDigest }).success, true);
+    fs.writeFileSync(path.join(dir, "migrations/001.sql"), "CREATE TABLE b (id int);");
+    assert.equal(run(dir, { expectDigest: first.scorecard.integrityDigest }).success, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI: unknown flags, missing values, and --flag=value", () => {
+  assert.deepEqual(parseArgs(["--approve-destructive"]).errors, ["Unknown option: --approve-destructive"]);
+  assert.equal(parseArgs(["--approve-risk"]).errors.length, 1);
+  assert.equal(parseArgs(["--sql=./migrations"]).sql, path.resolve("./migrations"));
+  assert.equal(quiet(() => executeCli(["--approve-destructive"])).value, 2);
 });

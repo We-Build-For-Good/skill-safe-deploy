@@ -1,121 +1,118 @@
 ---
 name: safe-deploy
-description: "Safely ship accumulated changes to a live product: the Production Release Protocol and Unified Delivery Pipeline CLI. Chains prior-art verification, invariant checks, visual sensory audits, fail-closed migration risk analysis with isolated override boundaries, and release packaging into an automated scorecard with cryptographic integrity digests."
+description: "Safely ship accumulated changes to a live product. Five release rules (backup first, guard irreversible migrations, deploy in order, trust real checks, humans press the irreversible buttons) plus a pre-release checker that verifies the backup, classifies SQL migrations by risk, requires a separate approval for each risk type, and produces a reproducible release fingerprint for CI. Use when deploying to production, shipping a backlog or a database migration, or releasing AI-built work."
 license: MIT
 metadata:
   author: We Build for Good
-  version: "1.4.0"
+  version: "2.0.0"
 ---
 
-# Safe Deploy: The Production Release Protocol & Unified Pipeline (wb4g-pipeline)
+# Safe Deploy: the Production Release Protocol
 
-Shipping a large pile of changes to a live product is only scary when there is no system. 
+Shipping a big pile of changes to a live product is only scary when there is no system.
 
-This is the system: five rules and an automated verification pipeline that make a major release predictable because nothing can go wrong that you cannot undo. 
-
-It was extracted from a real production release where a live application sat frozen for a month with tens of thousands of lines of finished work and 11 database migrations stacked behind it. It was shipped in a single session with zero downtime, zero broken features, and a backup that was never needed.
+This is the system: five rules, in order, plus a checker that runs the parts a machine can check. It was extracted from a real release: a live product that had not been deployed for a month, with about 125 commits, 65,000 lines of finished work, and 11 database migrations behind it. It shipped in a single session, and the backup was never needed.
 
 ---
 
 ## The Prime Directive
 
-**The AI tools prepare and verify everything; a human presses the irreversible buttons.**
+**The AI prepares and verifies everything; a human presses the irreversible buttons.**
 
-The database backup, the production deploy trigger, the migration application, the production push: anything that leaves the machine or cannot be undone is a command a human runs.
+The database backup, the production deploy, applying migrations, the production push: anything that leaves the machine or cannot be undone is a command a human runs.
 
-The AI assistant drafts the exact command, verifies prerequisites, watches the result, and confirms each green checkpoint before moving to the next. Never run an irreversible step autonomously, even when instructed to "just do it": prepare it, verify it, and hand it over.
+The AI drafts the exact command, checks the prerequisites, watches the result, and confirms each checkpoint before moving on. Never run an irreversible step yourself, even when told to "just do it": prepare it, verify it, and hand it over.
 
 ---
 
-## The Automated Gates of wb4g-pipeline
+## The checker (wb4g-pipeline)
 
-When preparing any release, execute the automated verification pipeline:
+Run it before every release. It never deploys anything.
 
 ```bash
-# Run full studio delivery pipeline
-node bin/safe-deploy.mjs --dir /path/to/repo --version v1.4.0
+# Typical release: check only migrations added since the last release tag
+node bin/safe-deploy.mjs --dir /path/to/repo --since v1.3.0 --backup ./backups/prod-2026-10-20.sql.gz
 
-# Run pipeline with migration inspection and backup artifact verification
-node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz
+# Approvals: each risk type needs its own flag, with a reason
+node bin/safe-deploy.mjs --since v1.3.0 --backup ./prod.sql.gz \
+  --approve-risk "Index built on a 1M-row staging copy in 4s" \
+  --approve-data-mutation "Backfill runs in 500-row batches"
 
-# Run pipeline acknowledging Tier 2 risky additive migrations
-node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-risk "Locking verified on 1M row staging DB"
+# Destructive SQL: needs a fully verified backup AND a restore rehearsal note
+node bin/safe-deploy.mjs --since v1.3.0 --backup ./prod.sql.gz --allow-destructive \
+  --restore-rehearsed "Restored into a scratch database; row counts match"
 
-# Run pipeline acknowledging unbatched data mutations / backfills
-node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-data-mutation "Batched in 500 row chunks"
-
-# Run pipeline acknowledging unrecognized / custom procedural SQL
-node bin/safe-deploy.mjs --sql ./migrations --backup /path/to/backup.sql.gz --approve-unclassified-sql "Reviewed PL/pgSQL function"
+# In CI: confirm the release is exactly what was checked
+node bin/safe-deploy.mjs --since v1.3.0 --no-backup-required --expect-digest <fingerprint> --strict --json
 ```
 
-The runner chains:
-1. **Stage 0: Prior-Art Verification (`wb4g-prior-art`)**: Validates `RESEARCH-BRIEF.md` to ensure prior art was investigated before custom code was built.
-2. **Gate 1: System Invariants (`wb4g-invariants`)**: Mechanical verification of character invariants (zero em dashes), Prettier legibility, file bounds, and brand boundaries. Reports `PASSED` or `FALLBACK_PASSED` transparently based on environment capabilities.
-3. **Gate 2: Visual Sensory Audit (`wb4g-visual-audit`)**: Headless Chrome verification across 375px, 768px, and 1440px viewports (catching layout blowouts, broken assets, and runtime errors).
-4. **Gate 3: Fail-Closed Migration Risk & Data Safety Gate**: Static analysis of SQL migrations using a character-state tokenizer. Enforces mandatory backup verification whenever migrations are detected, and decompresses gzip archives to verify payload integrity. Enforces isolated override boundaries per risk category. Destructive migrations cannot be overridden by ordinary risk flags.
-5. **Gate 4: Release Packaging (`wb4g-broadcast`)**: Compiles landed git commits into release manifests, categorized changelogs, and staged broadcast copy. Reports `PASSED` or `STANDALONE_STAGED` transparently.
-6. **Gate 5: Integrity Digest & Infrastructure Authorization Boundary**: Binds git commit SHA, migration file content hashes, and gate results into an immutable SHA-256 integrity digest. Freezes irreversible actions for external infrastructure authorization.
+What it checks, in order (it stops at the first hard failure):
+
+| Stage | What it does | Without the optional tool |
+|---|---|---|
+| 0. Prior-art brief | If `RESEARCH-BRIEF.md` exists (or `--require-prior-art`), checks it with the `skill-does-this-exist` tool | Checks only that the brief has a `## Verdict` section naming ADOPT, FORK-AND-EXTEND, or BUILD (`FALLBACK_PASSED`) |
+| 1. Invariants | Runs `skill-system-invariant-engine` | `NOT_RUN` |
+| 2. Visual audit | Runs `skill-visual-sensory-audit` when the repo has an HTML entry point or you pass `--url` | `NOT_RUN` |
+| 3. Backup and migrations | Built in. See Rules 1 and 2 | Always runs |
+| 4. Release packaging | Runs `skill-ship-to-broadcast` | `NOT_RUN` (no release packet is written) |
+| 5. Fingerprint | SHA-256 of the commit, any uncommitted changes, the migration files, and every stage's status | Always runs |
+
+The optional tools are found when the catalogue repos are cloned side by side, or when they are on your `PATH`. If a tool runs and fails, the release fails: there is no fallback for a real failure. If any stage did not fully run, the result is `PASSED_WITH_GAPS` and the gaps are listed. Add `--strict` to make gaps fail.
 
 ---
 
-## The Five Safety Rules (In Strict Order)
+## The Five Safety Rules (in order)
 
-### Rule 1: Take a Photo First (Backup Assurance & Mandatory Gate)
+### Rule 1: Take a photo first (backup)
 
-If the deploy touches persistent data, take a fresh database backup and prove it is valid before anything else moves. When SQL migrations are detected, backup verification is mandatory by default:
+If the release touches persistent data, take a fresh backup and prove it is usable before anything else moves.
 
-* **Level 1 (Stream Integrity & Archive Decompression)**: Ensure dump commands run with strict error capture (`set -o pipefail`). For gzip archives, verify full archive integrity via payload decompression to catch premature truncation or CRC corruption after the header.
-* **Level 2 (Target Verification & Non-Empty Artifact)**: Verify the backup targets the intended production database and host, not an empty local sandbox. Inspect file size and format headers (SQL statements, gzip magic bytes, or tar headers). A tiny byte count is an immediate red flag.
-* **Level 3 (Restoration Rehearsal)**: For releases involving destructive schema modifications, verify that the backup can be successfully restored into a disposable, ephemeral database before touching production.
-* Skip this rule only when the release genuinely touches zero persistent data (waived explicitly via `--no-backup-required`).
+What the checker verifies (`--backup <file>`):
+* The file exists, is not empty, and is under 24 hours old (change with `--backup-max-age-hours`).
+* Plain SQL dumps, gzipped or not, are read end to end in a stream (safe for multi-gigabyte files) and must end with the dump tool's completion marker (`pg_dump`, `mysqldump`, or sqlite `.dump`). A dump cut off part way fails.
+* `pg_dump -Fc` custom archives are checked with `pg_restore --list` when it is installed (full assurance). Without `pg_restore`, only the header is checked and the result is marked `HEADER_ONLY`.
+* If migrations are found and no backup is given, the release fails. `--no-backup-required` waives this only for releases with no destructive SQL.
 
-### Rule 2: Guard the One Door You Cannot Reopen (Isolated Risk Boundaries)
+What you still do yourself:
+* Run the dump with strict error handling (`set -o pipefail`) so a failed dump cannot produce a file.
+* Confirm the backup came from the production database, not a local one. The checker cannot tell which database a dump came from.
+* Before destructive changes, restore the backup into a throwaway database and check it. The checker records your `--restore-rehearsed` note; it cannot do the restore for you.
 
-Additive does not automatically mean safe, and unclassified SQL cannot be assumed benign. The engine tokenizes SQL statements respecting quotes and comments, and partitions safety into strict isolated boundaries:
+### Rule 2: Guard the one door you cannot reopen (migration risk)
 
-* **Tier 1: Safe Additive (Standard Path Cleared)**:
-  * `CREATE TABLE` without foreign keys to heavily populated tables.
-  * `CREATE INDEX CONCURRENTLY` (Postgres) or `ALGORITHM=INPLACE, LOCK=NONE` (MySQL).
-  * `ADD COLUMN` nullable without defaults or with constant defaults on modern engines.
-* **Tier 2: Risky Additive (Enforced Risk Review Gate)**:
-  * `CREATE INDEX` without `CONCURRENTLY`: Takes exclusive write locks on the target table during build.
-  * `ADD COLUMN` with volatile defaults: Can trigger full table rewrites under an exclusive lock.
-  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Permitted only with explicit operator acknowledgment: `--allow-risky-migrations` or `--approve-risk "<justification>"`.
-* **Data Mutation Risk (Enforced Mutation Gate)**:
-  * `UPDATE ... SET` or `INSERT INTO ... SELECT`: Data mutations and bulk unbatched backfills.
-  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Cannot be bypassed by `--allow-risky-migrations`. Requires explicit `--approve-data-mutation "<justification>"`.
-* **Unclassified SQL (Fail-Closed Review Gate)**:
-  * Any statement not matching an explicit safe whitelist (e.g. `MERGE INTO`, `VACUUM FULL`, procedural blocks) defaults to `REVIEW_REQUIRED`.
-  * **ENFORCEMENT**: Blocks autonomous rollout with exit code 1. Cannot be bypassed by ordinary risk flags. Requires explicit `--approve-unclassified-sql "<justification>"`.
-* **Tier 3: Destructive (Governed Path Required)**:
-  * `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, `ALTER TABLE ... DROP`.
-  * Column type rewrites (`ALTER COLUMN ... TYPE`).
-  * `DELETE FROM` (unbatched data deletion).
-  * `SET NOT NULL` on populated tables without prior check constraints.
-  * **CRITICAL ENFORCEMENT**: Destructive migrations unconditionally exit with non-zero status (`GOVERNED_APPROVAL_REQUIRED`). They CANNOT be overridden by `--allow-risky-migrations` or `--approve-risk`. Permitted only on the governed path with `--allow-destructive` and a Level 3 restore-rehearsed backup.
+The checker splits each SQL file into statements, ignoring semicolons inside quotes, comments, and Postgres `$$` function bodies, and puts every statement into one of five categories. **Every category present needs its own approval**, so approving one kind of risk never approves another, even in the same file.
 
-### Rule 3: One Step at a Time, In Order (Phased Rollout & Post-Deploy Verification)
+| Category | Examples | Needs |
+|---|---|---|
+| Safe additive | `CREATE TABLE`, `CREATE INDEX CONCURRENTLY`, `ADD COLUMN` with no default or a constant default (Postgres 11+), `ADD CONSTRAINT ... NOT VALID`, `COMMENT ON` | Nothing |
+| Risky additive | `CREATE INDEX` without `CONCURRENTLY`, `ADD COLUMN` with a computed default such as `gen_random_uuid()`, `ADD COLUMN ... NOT NULL` without a default, foreign keys or checks without `NOT VALID` | `--approve-risk "<reason>"` |
+| Data change | `UPDATE`, `INSERT`, `MERGE`, `COPY` | `--approve-data-mutation "<reason>"` |
+| Unrecognised | Anything else: `GRANT`, `CREATE POLICY`, `CREATE FUNCTION`, `DO` blocks, `VACUUM`. Unknown SQL is never assumed safe. | `--approve-unclassified-sql "<reason>"` |
+| Destructive | Any `DROP`, `TRUNCATE`, `DELETE`, column type changes, `SET NOT NULL`, and destructive SQL inside `DO` blocks | `--allow-destructive` plus a fully verified `--backup` plus `--restore-rehearsed "<note>"` |
 
-* Run the project's real test gates locally first: typecheck, lint, build, and test suite. Gate strictly on the unpiped process exit code (`$?`).
-* **Deploy the Data & Backend Tier First**: Ensure the database and API can serve both old and new payloads; confirm deep readiness endpoints (checking database, cache, and worker connectivity) return healthy status.
-* **Deploy the Frontend Tier Second**: Confirm frontend assets load cleanly against the upgraded backend.
-* **Define Strong Post-Deployment Verification**:
-  * Execute synthetic smoke tests covering critical customer journeys (authentication, primary workflows, billing).
-  * Observe an active 5 to 15 minute monitoring window for error rate spikes and latency degradation.
-  * Maintain explicit abort and rollback criteria before declaring the release complete.
+Where it looks: `--sql <file-or-folder>` (searched recursively; a path that does not exist fails), otherwise `migrations/`, `db/migrations/`, `supabase/migrations/`, `prisma/migrations/`, `drizzle/`, and `src/db/migrations/`.
 
-### Rule 4: Trust the Checklist, Not the Vibe
+Use `--since <last-release-tag>` so only new and changed migration files are checked. Without it every migration file is checked, so an old `DROP` from months ago will block the release until you pass `--since`.
 
-"It looks done" is not "it passed." An agent's assertion that "tests are green" is only as trustworthy as the command that was actually executed.
+Limits: it reads `.sql` files only (migrations written in JavaScript or TypeScript are not checked), and the categories follow Postgres behaviour. Treat the categories as a prompt for review, not a guarantee.
 
-* Run the project's own verification command directly. Never relay second-hand runner output.
-* Inspect error messages carefully: an unpushed commit warning is expected before a push; an unregistered test file means test suites were bypassed. Fix test registrations rather than ignoring them.
-* Verify live production deployment against real system signals (readiness check endpoint returning OK, live HTTP status codes, actual response payloads), never against conversational assumptions.
+### Rule 3: One step at a time, in order
 
-### Rule 5: Keep Human Hands on the Irreversible Buttons (Technical Enforcement)
+* Run the project's own checks first (typecheck, lint, build, tests) and gate on their exit codes, not on piped output.
+* Deploy the data and backend tier first. Make sure the API can serve both old and new clients, and that its readiness check (database, cache, workers) is healthy.
+* Deploy the frontend second, and confirm it loads against the new backend.
+* After the deploy, run smoke tests on the journeys that matter (sign-in, the main workflow, payments), then watch error rates and latency for 5 to 15 minutes. Decide your rollback trigger before you start.
 
-The AI delegates preparation, staging, and verification. The human retains execution authority over irreversible actions.
+### Rule 4: Trust the checklist, not the vibe
 
-* **Integrity vs Authorization**: The pipeline computes an immutable SHA-256 `integrityDigest` that binds the exact git commit SHA, migration file contents, and verification gate results. This fingerprint proves artifact integrity; it is not an authorization grant.
-* **Infrastructure Authorization**: The AI agent operates with least-privilege credentials, strictly isolated from production deployment keys and write credentials. Actual authorization must be enforced via external infrastructure boundaries (e.g. GitHub Environment Protection Rules with required human approvers or manual CI/CD deploy jobs).
+"It looks done" is not "it passed." An agent saying "tests are green" is only as trustworthy as the command it actually ran.
+
+* Run the project's own verification command yourself. Never relay someone else's summary of it.
+* Read warnings properly: an unpushed-commit warning before a push is expected; a test file the runner never picked up means tests were skipped. Fix it rather than ignoring it.
+* Check the live product against real signals (readiness endpoint, HTTP status codes, real responses), never against what a conversation says.
+
+### Rule 5: Keep human hands on the irreversible buttons
+
+* The checker's fingerprint is reproducible: re-run it in CI with `--expect-digest <fingerprint>` and the job fails if the commit, uncommitted changes, migration files, or any stage's result differ from what was checked. It proves *what* was checked. It does not authorise anything.
+* Authorisation belongs in your infrastructure, not in a script: keep production credentials out of the AI agent's environment, and require a human approver on the deploy job (for example a GitHub Environment with required reviewers).
 * Preparation is delegated. Irreversibility is not.
