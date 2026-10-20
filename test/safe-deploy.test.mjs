@@ -12,7 +12,8 @@ import {
   splitSqlStatements,
   analyzeMigrationSql,
   inspectMigrationDirectory,
-  generateIntegrityDigest
+  generateIntegrityDigest,
+  fallbackBriefCheck
 } from "../bin/safe-deploy.mjs";
 import { execFileSync } from "node:child_process";
 
@@ -553,4 +554,25 @@ test("CLI: unknown flags, missing values, and --flag=value", () => {
   assert.equal(parseArgs(["--approve-risk"]).errors.length, 1);
   assert.equal(parseArgs(["--sql=./migrations"]).sql, path.resolve("./migrations"));
   assert.equal(quiet(() => executeCli(["--approve-destructive"])).value, 2);
+});
+
+test("Prior-art fallback accepts the tool's own format and rejects unfilled briefs", () => {
+  assert.equal(fallbackBriefCheck("Verdict: **BUILD**\n"), null);
+  assert.equal(fallbackBriefCheck("## Verdict\nADOPT: use the library\n"), null);
+  assert.match(fallbackBriefCheck("Verdict: **BUILD**\nTODO: candidate\n"), /TODO/);
+  assert.match(fallbackBriefCheck("No decision here"), /no verdict/);
+});
+
+test("Prior-art stage fails on a brief generated with no research", () => {
+  const tool = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../skill-does-this-exist/bin/does-this-exist.mjs");
+  const dir = fixture({ "index.html": "<html></html>" });
+  try {
+    if (fs.existsSync(tool)) execFileSync(process.execPath, [tool, "generate", "--output", path.join(dir, "RESEARCH-BRIEF.md")]);
+    else fs.writeFileSync(path.join(dir, "RESEARCH-BRIEF.md"), "Verdict: **BUILD**\nTODO: candidate\n");
+    const r = run(dir);
+    assert.equal(r.success, false);
+    assert.equal(r.scorecard.failedStage, "priorArt");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

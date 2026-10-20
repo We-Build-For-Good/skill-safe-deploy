@@ -45,6 +45,18 @@ const TOOLS = {
 };
 
 /**
+ * Minimal brief check used when the prior-art tool is not installed.
+ * Accepts the tool's own format ("Verdict: **BUILD**") or a "## Verdict" section. Returns an error message or null.
+ */
+export function fallbackBriefCheck(content) {
+  if (/TODO:/.test(content)) return "RESEARCH-BRIEF.md still has TODO lines.";
+  const inline = /Verdict:\s*\*\*(ADOPT|FORK-AND-EXTEND|BUILD)\*\*/i.test(content);
+  const section = /^##\s*Verdict\b[^\n]*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(content);
+  if (inline || (section && /\b(ADOPT|FORK-AND-EXTEND|BUILD)\b/.test(section[0]))) return null;
+  return "RESEARCH-BRIEF.md has no verdict (Verdict: **ADOPT|FORK-AND-EXTEND|BUILD** or a '## Verdict' section).";
+}
+
+/**
  * Runs a tool. Distinguishes "not installed" (available: false) from "ran and failed".
  */
 export function runTool(toolConfig, args, cwd) {
@@ -832,13 +844,10 @@ export function runPipeline(rawOptions) {
       scorecard.stages.priorArt.status = "PASSED";
       scorecard.stages.priorArt.details = "The prior-art tool verified RESEARCH-BRIEF.md.";
     } else {
-      const content = fs.readFileSync(briefPath, "utf8");
-      const verdictSection = /^##\s*Verdict\b[^\n]*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(content);
-      if (!verdictSection || !/\b(ADOPT|FORK-AND-EXTEND|FORK|BUILD)\b/.test(verdictSection[0])) {
-        return fail("priorArt", "FAILED", "RESEARCH-BRIEF.md has no '## Verdict' section naming ADOPT, FORK-AND-EXTEND, or BUILD.");
-      }
+      const problem = fallbackBriefCheck(fs.readFileSync(briefPath, "utf8"));
+      if (problem) return fail("priorArt", "FAILED", problem);
       scorecard.stages.priorArt.status = "FALLBACK_PASSED";
-      scorecard.stages.priorArt.details = "Prior-art tool not installed; only checked that the brief has a Verdict section.";
+      scorecard.stages.priorArt.details = "Prior-art tool not installed; only checked for a verdict and no TODO lines.";
       scorecard.gaps.push(`${scorecard.stages.priorArt.name}: structure check only`);
     }
     log(`[${scorecard.stages.priorArt.name}] ${scorecard.stages.priorArt.status}`);
